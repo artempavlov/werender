@@ -343,10 +343,9 @@ python -m pytest tests/test_security.py -v
 
 ## Known Limitations
 
-1. **Dashboard**: Currently still unprotected (requires API key in future)
-2. **WebSocket**: Not authenticated (planned enhancement)
-3. **API Keys**: Stored in plain text (use HTTPS in production)
-4. **Rate Limiting**: In-memory only (resets on restart)
+1. **Dashboard shell**: Static files are public; protected data uses authenticated HTTP polling.
+2. **API Keys**: Stored in plain text (use HTTPS in production)
+3. **Rate Limiting**: In-memory only (resets on restart)
 
 ## Future Enhancements
 
@@ -355,8 +354,6 @@ python -m pytest tests/test_security.py -v
 3. **IP Whitelisting** - Additional access control
 4. **Multi-Factor Auth** - Enhanced security
 5. **Audit Logging** - Detailed security events
-6. **Dashboard Auth** - Protect web interface
-7. **WebSocket Auth** - Secure real-time updates
 
 ## References
 

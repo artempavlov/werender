@@ -328,7 +328,8 @@ class SyncManager:
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
                 if addon_path.is_dir():
                     for file in addon_path.rglob("*"):
-                        if file.name == "__pycache__" or ".git" in file.parts:
+                        relative_parts = file.relative_to(addon_path).parts
+                        if any(part in {"__pycache__", ".git"} for part in relative_parts):
                             continue
                         zf.write(file, file.relative_to(addon_path.parent))
                 else:

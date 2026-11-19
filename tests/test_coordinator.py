@@ -3,17 +3,18 @@
 import asyncio
 import hashlib
 import io
-import os
+import shutil
 import tempfile
 import time
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
-from fastapi.websockets import WebSocket, WebSocketDisconnect
 
-from werender.core.job import FrameTask, RenderJob, TaskStatus
+from tests.test_result_delivery import PNG
+
+from werender.core.job import RenderJob, TaskStatus
 from werender.network.coordinator import CoordinatorServer, WorkerInfo
 from werender.network.discovery import NodeInfo
 
@@ -38,7 +39,11 @@ def mock_blender_renderer():
     """Mock BlenderRenderer."""
     mock_renderer = MagicMock()
     mock_renderer.get_version.return_value = "4.0.0"
-    mock_renderer.pack_resources.return_value = Path("/tmp/test_packed.blend")
+    def pack(source, output_path):
+        shutil.copyfile(source, output_path)
+        return output_path
+
+    mock_renderer.pack_resources.side_effect = pack
     return mock_renderer
 
 
@@ -76,17 +81,15 @@ def mock_sync_manager():
 
 
 @pytest.fixture
-def coordinator(mock_system_specs, mock_blender_renderer, mock_discovery_service, mock_sync_manager):
+def coordinator(mock_system_specs, mock_blender_renderer, mock_discovery_service, mock_sync_manager, tmp_path, monkeypatch):
     """Create a CoordinatorServer instance with mocked dependencies."""
+    monkeypatch.setenv("HOME", str(tmp_path))
     with patch("werender.utils.system.get_system_specs", return_value=mock_system_specs), \
          patch("werender.core.blender.BlenderRenderer", return_value=mock_blender_renderer), \
          patch("werender.network.coordinator.BlenderRenderer", return_value=mock_blender_renderer), \
          patch("werender.network.coordinator.DiscoveryService", return_value=mock_discovery_service), \
          patch("werender.network.coordinator.SyncManager", return_value=mock_sync_manager):
         coord = CoordinatorServer(port=8420)
-        # Use real temp directory for config
-        coord.config_dir = Path(tempfile.mkdtemp())
-        coord.config_dir.mkdir(exist_ok=True)
         coord.sync_manager = mock_sync_manager
         return coord
 
@@ -104,11 +107,12 @@ def sample_blend_file():
 
 
 @pytest.fixture
-def sample_job(coordinator, sample_blend_file):
+def sample_job(coordinator, sample_blend_file, tmp_path):
     """Create a sample render job."""
     job = RenderJob(
         name="Test Job",
         blend_file=sample_blend_file,
+        output_directory=tmp_path / "frames",
         frame_start=1,
         frame_end=5,
     )
@@ -158,8 +162,6 @@ def client(coordinator, auth_headers):
         
         def _get_auth_header(self, endpoint: str) -> dict:
             """Determine which auth header to use based on endpoint."""
-            # Worker endpoints
-            worker_endpoints = ["/api/tasks/request", "/api/tasks/", "/api/jobs/", "/api/sync/"]
             # Check if it's a worker-only endpoint (task request, complete, fail, get blend, sync)
             if any(endpoint.startswith(ep) for ep in ["/api/tasks/request", "/api/sync/"]):
                 return self._auth_headers["worker"]
@@ -238,10 +240,6 @@ class TestCoordinatorServerInitialization:
         # Workers may be loaded from database, so clear them for this test
         coordinator.workers.clear()
         assert coordinator.workers == {}
-
-    def test_init_initializes_empty_websocket_connections(self, coordinator):
-        """Test that websocket connections list is initialized empty."""
-        assert coordinator.websocket_connections == []
 
     def test_init_creates_fastapi_app(self, coordinator):
         """Test that FastAPI app is created."""
@@ -338,9 +336,8 @@ class TestOnWorkerDiscovered:
     """Tests for _on_worker_discovered method."""
 
     @pytest.mark.asyncio
-    async def test_on_worker_discovered_broadcasts_update(self, coordinator):
+    async def test_on_worker_discovered_does_not_register_unverified_worker(self, coordinator):
         """Test that worker discovery broadcasts update."""
-        coordinator._broadcast_update = AsyncMock()
 
         node = NodeInfo(
             name="test-worker",
@@ -352,12 +349,11 @@ class TestOnWorkerDiscovered:
 
         await coordinator._on_worker_discovered(node)
 
-        coordinator._broadcast_update.assert_called_once_with("workers")
+        assert not coordinator.workers
 
     @pytest.mark.asyncio
     async def test_on_worker_discovered_with_various_node_types(self, coordinator):
         """Test worker discovery with different node types."""
-        coordinator._broadcast_update = AsyncMock()
 
         for node_type in ["worker", "coordinator"]:
             node = NodeInfo(
@@ -370,7 +366,7 @@ class TestOnWorkerDiscovered:
 
             await coordinator._on_worker_discovered(node)
 
-        assert coordinator._broadcast_update.call_count == 2
+        assert not coordinator.workers
 
 
 # ============================================================================
@@ -382,10 +378,9 @@ class TestOnWorkerRemoved:
     """Tests for _on_worker_removed method."""
 
     @pytest.mark.asyncio
-    async def test_on_worker_removed_removes_worker(self, coordinator, sample_worker):
+    async def test_on_worker_removed_keeps_authenticated_worker(self, coordinator, sample_worker):
         """Test that worker is removed when node is removed."""
         coordinator.workers[sample_worker.worker_id] = sample_worker
-        coordinator._broadcast_update = AsyncMock()
 
         node = NodeInfo(
             name=sample_worker.worker_name,
@@ -397,11 +392,10 @@ class TestOnWorkerRemoved:
 
         await coordinator._on_worker_removed(node)
 
-        assert sample_worker.worker_id not in coordinator.workers
-        coordinator._broadcast_update.assert_called_once_with("workers")
+        assert sample_worker.worker_id in coordinator.workers
 
     @pytest.mark.asyncio
-    async def test_on_worker_removed_requeues_task(self, coordinator, sample_worker, sample_job):
+    async def test_on_worker_removed_keeps_active_lease(self, coordinator, sample_worker, sample_job):
         """Test that task is re-queued when worker is removed."""
         # Assign a task to the worker
         task = sample_job.tasks[0]
@@ -410,7 +404,6 @@ class TestOnWorkerRemoved:
         sample_worker.current_task_id = task.id
 
         coordinator.workers[sample_worker.worker_id] = sample_worker
-        coordinator._broadcast_update = AsyncMock()
 
         node = NodeInfo(
             name=sample_worker.worker_name,
@@ -422,12 +415,11 @@ class TestOnWorkerRemoved:
 
         await coordinator._on_worker_removed(node)
 
-        # Task should be reset to pending
-        assert task.status == TaskStatus.PENDING
-        assert task.assigned_worker is None
+        assert task.status == TaskStatus.RENDERING
+        assert task.assigned_worker == sample_worker.worker_id
 
     @pytest.mark.asyncio
-    async def test_on_worker_removed_multiple_workers(self, coordinator):
+    async def test_on_worker_removed_does_not_remove_by_hostname(self, coordinator):
         """Test removing worker when multiple workers exist."""
         worker1 = WorkerInfo(
             worker_id="worker-001",
@@ -446,7 +438,6 @@ class TestOnWorkerRemoved:
 
         coordinator.workers[worker1.worker_id] = worker1
         coordinator.workers[worker2.worker_id] = worker2
-        coordinator._broadcast_update = AsyncMock()
 
         node = NodeInfo(
             name=worker1.worker_name,
@@ -458,13 +449,12 @@ class TestOnWorkerRemoved:
 
         await coordinator._on_worker_removed(node)
 
-        assert worker1.worker_id not in coordinator.workers
+        assert worker1.worker_id in coordinator.workers
         assert worker2.worker_id in coordinator.workers
 
     @pytest.mark.asyncio
     async def test_on_worker_removed_nonexistent_worker(self, coordinator):
         """Test handling removal of worker that doesn't exist."""
-        coordinator._broadcast_update = AsyncMock()
 
         node = NodeInfo(
             name="nonexistent-worker",
@@ -476,7 +466,7 @@ class TestOnWorkerRemoved:
 
         # Should not raise an error
         await coordinator._on_worker_removed(node)
-        coordinator._broadcast_update.assert_called_once_with("workers")
+        assert not coordinator.workers
 
 
 # ============================================================================
@@ -537,7 +527,6 @@ class TestApiRequestTask:
         assert response.status_code == 200
 
         # Get the coordinator from the app state
-        from werender.network.coordinator import CoordinatorServer
         coordinator = client.app.state.coordinator
 
         if coordinator and "worker-001" in coordinator.workers:
@@ -619,13 +608,13 @@ class TestApiCompleteTask:
         task.start_rendering()
 
         # Create mock output file
-        output_content = b"fake image data"
+        output_content = PNG
         output_file = io.BytesIO(output_content)
 
         response = client.post(
             f"/api/tasks/{task.id}/complete",
             files={"output": ("0001.png", output_file, "image/png")},
-            data={"render_time": "1.5"},
+            data={"render_time": "1.5", "assignment": task.assigned_at.isoformat()},
         )
         assert response.status_code == 200
         assert response.json()["status"] == "success"
@@ -635,7 +624,7 @@ class TestApiCompleteTask:
         """Test completing a non-existent task."""
         response = client.post(
             "/api/tasks/nonexistent/complete",
-            files={"output": ("0001.png", io.BytesIO(b"data"), "image/png")},
+            files={"output": ("0001.png", io.BytesIO(PNG), "image/png")},
             data={"render_time": "1.5"},
         )
         assert response.status_code == 404
@@ -652,8 +641,8 @@ class TestApiCompleteTask:
 
         response = client.post(
             f"/api/tasks/{task.id}/complete",
-            files={"output": ("0001.png", io.BytesIO(b"data"), "image/png")},
-            data={"render_time": "1.5"},
+            files={"output": ("0001.png", io.BytesIO(PNG), "image/png")},
+            data={"render_time": "1.5", "assignment": task.assigned_at.isoformat()},
         )
         assert response.status_code == 200
         assert coordinator.workers[sample_worker.worker_id].current_task_id is None
@@ -669,8 +658,8 @@ class TestApiCompleteTask:
 
             response = client.post(
                 f"/api/tasks/{task.id}/complete",
-                files={"output": (f"{task.frame_number:04d}.png", io.BytesIO(b"data"), "image/png")},
-                data={"render_time": "1.5"},
+                files={"output": (f"{task.frame_number:04d}.png", io.BytesIO(PNG), "image/png")},
+                data={"render_time": "1.5", "assignment": task.assigned_at.isoformat()},
             )
             assert response.status_code == 200
 
@@ -688,11 +677,12 @@ class TestApiFailTask:
 
         response = client.post(
             f"/api/tasks/{task.id}/fail",
-            json={"error": "Out of memory"},
+            json={"error": "Out of memory", "assignment": task.assigned_at.isoformat()},
         )
         assert response.status_code == 200
         assert response.json()["status"] == "success"
-        assert task.status == TaskStatus.FAILED
+        assert task.status == TaskStatus.PENDING
+        assert task.failures == 1
         assert task.error_message == "Out of memory"
 
     def test_fail_task_not_found(self, client):
@@ -715,7 +705,7 @@ class TestApiFailTask:
 
         response = client.post(
             f"/api/tasks/{task.id}/fail",
-            json={"error": "Render failed"},
+            json={"error": "Render failed", "assignment": task.assigned_at.isoformat()},
         )
         assert response.status_code == 200
         assert coordinator.workers[sample_worker.worker_id].current_task_id is None
@@ -727,7 +717,7 @@ class TestApiFailTask:
 
         response = client.post(
             f"/api/tasks/{task.id}/fail",
-            json={},
+            json={"assignment": task.assigned_at.isoformat()},
         )
         assert response.status_code == 200
         assert task.error_message == "Unknown error"
@@ -1042,7 +1032,8 @@ class TestApiUpdateJob:
             json={"start_frame": 1, "end_frame": 3},
         )
         assert response.status_code == 200
-        assert sample_job.status == "pending"
+        assert sample_job.status == "completed"
+        assert sample_job.completed_frames == 3
 
 
 class TestApiGetBlendFile:
@@ -1262,99 +1253,6 @@ class TestApiDownloadAddon:
 # ============================================================================
 
 
-class TestWebSocketEndpoint:
-    """Tests for _websocket_endpoint."""
-
-    def test_websocket_accepts_connection(self, coordinator):
-        """Test that WebSocket accepts connection."""
-        mock_websocket = AsyncMock(spec=WebSocket)
-        mock_websocket.receive_text.side_effect = [AsyncMock(), WebSocketDisconnect()]
-
-        # This would need to be tested with a real WebSocket client
-        # For unit testing, we test the broadcast functionality instead
-        pass
-
-
-class TestBroadcastUpdate:
-    """Tests for _broadcast_update method."""
-
-    @pytest.mark.asyncio
-    async def test_broadcast_update_no_connections(self, coordinator):
-        """Test broadcasting with no connections."""
-        # Should not raise an error
-        await coordinator._broadcast_update("jobs")
-
-    @pytest.mark.asyncio
-    async def test_broadcast_update_jobs(self, coordinator, sample_job):
-        """Test broadcasting jobs update."""
-        mock_websocket = AsyncMock()
-        coordinator.websocket_connections = [mock_websocket]
-
-        await coordinator._broadcast_update("jobs")
-
-        mock_websocket.send_json.assert_called_once()
-        call_args = mock_websocket.send_json.call_args[0][0]
-        assert call_args["type"] == "jobs"
-        assert "jobs" in call_args
-
-    @pytest.mark.asyncio
-    async def test_broadcast_update_workers(self, coordinator, sample_worker):
-        """Test broadcasting workers update."""
-        mock_websocket = AsyncMock()
-        coordinator.websocket_connections = [mock_websocket]
-        coordinator.workers[sample_worker.worker_id] = sample_worker
-
-        await coordinator._broadcast_update("workers")
-
-        mock_websocket.send_json.assert_called_once()
-        call_args = mock_websocket.send_json.call_args[0][0]
-        assert call_args["type"] == "workers"
-        assert "workers" in call_args
-
-    @pytest.mark.asyncio
-    async def test_broadcast_update_all(self, coordinator, sample_job, sample_worker):
-        """Test broadcasting all updates."""
-        mock_websocket = AsyncMock()
-        coordinator.websocket_connections = [mock_websocket]
-        coordinator.workers[sample_worker.worker_id] = sample_worker
-
-        await coordinator._broadcast_update("all")
-
-        mock_websocket.send_json.assert_called_once()
-        call_args = mock_websocket.send_json.call_args[0][0]
-        assert call_args["type"] == "all"
-        assert "jobs" in call_args
-        assert "workers" in call_args
-
-    @pytest.mark.asyncio
-    async def test_broadcast_update_removes_disconnected(self, coordinator):
-        """Test that disconnected websockets are removed."""
-        mock_websocket = AsyncMock()
-        mock_websocket.send_json.side_effect = Exception("Connection lost")
-        coordinator.websocket_connections = [mock_websocket]
-
-        await coordinator._broadcast_update("jobs")
-
-        assert len(coordinator.websocket_connections) == 0
-
-    @pytest.mark.asyncio
-    async def test_broadcast_update_multiple_connections(self, coordinator):
-        """Test broadcasting to multiple connections."""
-        mock_ws1 = AsyncMock()
-        mock_ws2 = AsyncMock()
-        coordinator.websocket_connections = [mock_ws1, mock_ws2]
-
-        await coordinator._broadcast_update("jobs")
-
-        mock_ws1.send_json.assert_called_once()
-        mock_ws2.send_json.assert_called_once()
-
-
-# ============================================================================
-# Tests for Background Loops
-# ============================================================================
-
-
 class TestHealthCheckLoop:
     """Tests for _health_check_loop."""
 
@@ -1429,33 +1327,6 @@ class TestHealthCheckLoop:
         assert sample_worker.worker_id in coordinator.workers
 
 
-class TestBroadcastUpdatesLoop:
-    """Tests for _broadcast_updates_loop."""
-
-    @pytest.mark.asyncio
-    async def test_broadcast_updates_loop_broadcasts(self, coordinator):
-        """Test that broadcast loop sends updates."""
-        coordinator._broadcast_update = AsyncMock()
-
-        # Run one iteration - must wait longer than 2 second sleep in the loop
-        async_task = asyncio.create_task(coordinator._broadcast_updates_loop())
-        await asyncio.sleep(3)  # Wait longer than the 2 second sleep in the loop
-        async_task.cancel()
-
-        try:
-            await async_task
-        except asyncio.CancelledError:
-            pass
-
-        # Should have broadcast at least once
-        coordinator._broadcast_update.assert_called()
-
-
-# ============================================================================
-# Tests for Lifecycle Methods
-# ============================================================================
-
-
 class TestLifecycleMethods:
     """Tests for lifecycle methods."""
 
@@ -1482,7 +1353,7 @@ class TestLifecycleMethods:
         assert "/api/tasks/request" in routes
         assert "/api/jobs" in routes
         assert "/api/workers" in routes
-        assert "/ws" in routes
+        assert "/ws" not in routes
 
 
 class TestSetupRoutes:
@@ -1517,10 +1388,10 @@ class TestSetupRoutes:
         assert "/api/sync/settings" in routes
         assert "/api/sync/addons" in routes
 
-    def test_setup_routes_registers_websocket(self, coordinator):
-        """Test that WebSocket endpoint is registered."""
+    def test_setup_routes_does_not_register_websocket(self, coordinator):
+        """Dashboard uses authenticated HTTP polling."""
         routes = [route.path for route in coordinator.app.routes]
-        assert "/ws" in routes
+        assert "/ws" not in routes
 
     def test_setup_routes_registers_event_handlers(self, coordinator):
         """Test that event handlers are registered."""
@@ -1657,8 +1528,7 @@ class TestApiResourceManagement:
         response = client.post(
             f"/api/resources/workers/{sample_worker.worker_id}/limits",
             json={
-                "max_concurrent_tasks": 2,
-                "cpu_utilization_cap": 0.8,
+                "max_concurrent_tasks": 1,
                 "tags": ["gpu", "fast"]
             }
         )

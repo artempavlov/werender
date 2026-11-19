@@ -2,8 +2,8 @@
 
 import json
 import zipfile
-from pathlib import Path
-from unittest.mock import Mock, patch
+from datetime import datetime
+from unittest.mock import patch
 
 import pytest
 
@@ -64,6 +64,13 @@ class TestSyncManagerInit:
 class TestGetManifest:
     """Tests for get_manifest method."""
 
+    @pytest.fixture(autouse=True)
+    def clock(self):
+        now = datetime(2026, 11, 19, 12, 0)
+        with patch("werender.network.sync.datetime") as clock:
+            clock.now.return_value = now
+            yield clock
+
     def test_get_manifest_with_no_paths(self):
         """Test getting manifest when no paths are configured."""
         manager = SyncManager()
@@ -72,7 +79,7 @@ class TestGetManifest:
 
         assert manifest["settings_hash"] == ""
         assert manifest["addons_hash"] == ""
-        assert manifest["timestamp"] == 0
+        assert manifest["timestamp"] == "2026-11-19T12:00:00"
 
     def test_get_manifest_with_config_only(self, temp_config_file):
         """Test getting manifest with only config file."""
@@ -82,7 +89,7 @@ class TestGetManifest:
 
         assert manifest["settings_hash"] != ""
         assert manifest["addons_hash"] == ""
-        assert manifest["timestamp"] == 0
+        assert manifest["timestamp"] == "2026-11-19T12:00:00"
 
     def test_get_manifest_with_addons_only(self, temp_addons_dir):
         """Test getting manifest with only addons directory."""
@@ -92,7 +99,7 @@ class TestGetManifest:
 
         assert manifest["settings_hash"] == ""
         assert manifest["addons_hash"] != ""
-        assert manifest["timestamp"] == 0
+        assert manifest["timestamp"] == "2026-11-19T12:00:00"
 
     def test_get_manifest_with_both(self, temp_config_file, temp_addons_dir):
         """Test getting manifest with both config and addons."""
@@ -104,18 +111,21 @@ class TestGetManifest:
 
         assert manifest["settings_hash"] != ""
         assert manifest["addons_hash"] != ""
-        assert manifest["timestamp"] == 0
+        assert manifest["timestamp"] == "2026-11-19T12:00:00"
 
-    def test_get_manifest_deterministic(self, temp_config_file, temp_addons_dir):
-        """Test that manifest is deterministic (same inputs = same output)."""
+    def test_get_manifest_deterministic(self, temp_config_file, temp_addons_dir, clock):
+        """The digest pair is stable while the timestamp tracks each request."""
         manager = SyncManager(
             config_path=temp_config_file, addons_dir=temp_addons_dir
         )
 
         manifest1 = manager.get_manifest()
+        clock.now.return_value = datetime(2026, 11, 19, 12, 1)
         manifest2 = manager.get_manifest()
 
-        assert manifest1 == manifest2
+        assert manifest1["settings_hash"] == manifest2["settings_hash"]
+        assert manifest1["addons_hash"] == manifest2["addons_hash"]
+        assert manifest2["timestamp"] == "2026-11-19T12:01:00"
 
 
 class TestGetAddonsList:
@@ -349,7 +359,7 @@ class TestPackageAddon:
 
         assert result is not None
         with zipfile.ZipFile(result, "r") as zf:
-            assert "__pycache__" not in [n.split("/")[0] for n in zf.namelist()]
+            assert zf.namelist() == ["test_addon/__init__.py"]
 
     def test_package_addon_excludes_git(self, tmp_path):
         """Test that package_addon excludes .git directories."""
@@ -368,4 +378,4 @@ class TestPackageAddon:
 
         assert result is not None
         with zipfile.ZipFile(result, "r") as zf:
-            assert ".git" not in [n.split("/")[0] for n in zf.namelist()]
+            assert zf.namelist() == ["test_addon/__init__.py"]

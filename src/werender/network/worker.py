@@ -1,17 +1,15 @@
 """Worker node for WeRender."""
 
 import asyncio
-import json
+import mimetypes
+import os
 import tempfile
-import time
 import zipfile
 from pathlib import Path
 from typing import Optional, Set
 
 import httpx
-from websockets import connect as websocket_connect
-
-from werender.core.blender import BlenderRenderer, RenderResult
+from werender.core.blender import BlenderRenderer
 from werender.network.discovery import DiscoveryService, NodeInfo
 from werender.network.auth import get_worker_api_key
 from werender.network.transfer import (
@@ -19,9 +17,18 @@ from werender.network.transfer import (
     BandwidthManager,
     NetworkQualityDetector,
     TransferPriority,
-    CompressionLevel,
 )
 from werender.network.chunked_transfer import ChunkedTransfer
+from werender.network.security import matches_file_hash, new_file_hasher
+
+CHUNKED_THRESHOLD = 50 * 1024 * 1024
+HEARTBEAT_INTERVAL = 8
+DOWNLOAD_TIMEOUT = 20 * 60
+TASK_REPORT_TIMEOUT = 180
+
+
+class TaskReportTimeout(Exception):
+    """The coordinator could not acknowledge a task report in time."""
 
 
 class WorkerNode:
@@ -42,17 +49,19 @@ class WorkerNode:
         import socket
         import uuid
 
-        self.name = name or socket.gethostname()
+        self.name = name or os.getenv("WERENDER_WORKER_NAME") or socket.gethostname()
         self.port = port
-        self.node_id = str(uuid.uuid4())[:8]
+        self.node_id = str(uuid.uuid4())
 
         # Get system specs
         from werender.utils.system import get_system_specs
         self.specs = get_system_specs()
+        self.gpu_name = os.getenv("WERENDER_GPU_NAME") or self.specs.gpu_name or "None"
 
         # Get Blender version
+        self.blender = BlenderRenderer()
         try:
-            self.blender_version = BlenderRenderer().get_version()
+            self.blender_version = self.blender.get_version()
         except Exception:
             self.blender_version = ""
 
@@ -67,7 +76,7 @@ class WorkerNode:
                 "cpu_cores": self.specs.cpu_cores,
                 "cpu_threads": self.specs.cpu_threads,
                 "ram_gb": self.specs.ram_gb,
-                "gpu_name": self.specs.gpu_name or "None",
+                "gpu_name": self.gpu_name,
                 "gpu_vram_gb": self.specs.gpu_vram_gb or 0,
                 "blender_version": self.blender_version,
             },
@@ -75,9 +84,8 @@ class WorkerNode:
 
         # Worker state
         self.coordinator: Optional[NodeInfo] = None
-        self.blender = BlenderRenderer()
-        self.temp_dir = Path(tempfile.gettempdir()) / "werender" / self.node_id
-        self.temp_dir.mkdir(parents=True, exist_ok=True)
+        self._workspace = tempfile.TemporaryDirectory(prefix="werender-worker-")
+        self.temp_dir = Path(self._workspace.name)
         
         # Sync state
         self.config_dir = Path.home() / ".werender"
@@ -106,14 +114,14 @@ class WorkerNode:
 
     def start(self) -> None:
         """Start the worker node."""
-        print(f"🎬 WeRender - Worker Node")
+        print("🎬 WeRender - Worker Node")
         print("=" * 50)
         print(f"📛 Name: {self.name}")
         print(f"🆔 Node ID: {self.node_id}")
         print(f"🖥️  CPU: {self.specs.cpu_cores} cores")
         print(f"💾 RAM: {self.specs.ram_gb} GB")
-        if self.specs.gpu_name:
-            print(f"🎮 GPU: {self.specs.gpu_name}")
+        if self.gpu_name != "None":
+            print(f"🎮 GPU: {self.gpu_name}")
         print(f"🎨 Blender: {self.blender_version or 'Not found'}")
         print()
 
@@ -131,18 +139,18 @@ class WorkerNode:
             print()
             return
 
-        print()
-        print("🔍 Scanning for coordinator...")
-
-        # Set up discovery callbacks
-        self.discovery.on_discovery = self._on_coordinator_discovered
-        self.discovery.on_removal = self._on_coordinator_removed
-
-        # Start discovery
-        self.discovery.start()
-
-        # Run async worker loop
-        asyncio.run(self._worker_loop())
+        if address := os.getenv("WERENDER_COORDINATOR_HOST"):
+            try:
+                port = int(os.getenv("WERENDER_COORDINATOR_PORT", "8420"))
+                if not 1 <= port <= 65535:
+                    raise ValueError
+            except ValueError:
+                print("❌ WERENDER_COORDINATOR_PORT must be an integer from 1 to 65535")
+                return
+            asyncio.run(self._direct_loop(address, port))
+        else:
+            print("🔍 Scanning for coordinator...")
+            asyncio.run(self._discovery_loop())
 
     def stop(self) -> None:
         """Stop the worker node."""
@@ -153,30 +161,60 @@ class WorkerNode:
     async def _worker_loop(self) -> None:
         """Main worker loop."""
         self.is_running = True
-        self.http_client = httpx.AsyncClient(timeout=30.0)
-
-        while self.is_running:
+        async with httpx.AsyncClient(timeout=90.0, trust_env=False) as self.http_client:
             try:
-                if self.coordinator:
-                    if not self.is_synced:
-                        await self._sync_with_coordinator()
-                    
-                    if self.is_synced:
-                        await self._request_and_render_task()
-                else:
-                    # No coordinator, wait a bit
-                    await asyncio.sleep(2)
-            except Exception as e:
-                print(f"❌ Error in worker loop: {e}")
-                await asyncio.sleep(5)
+                while self.is_running:
+                    try:
+                        if self.coordinator:
+                            if not self.is_synced:
+                                await self._sync_with_coordinator()
+                            if self.coordinator and self.is_synced:
+                                await self._request_and_render_task()
+                            if self.is_running:
+                                await asyncio.sleep(1)
+                        else:
+                            await asyncio.sleep(2)
+                    except Exception as e:
+                        print(f"❌ Error in worker loop: {e}")
+                        await asyncio.sleep(5)
+            finally:
+                self.is_running = False
 
-        # Cleanup
-        if self.http_client:
-            await self.http_client.aclose()
+    async def _direct_loop(self, address: str, port: int) -> None:
+        self.coordinator = NodeInfo("coordinator", address, port, "coordinator", {})
+        self.is_synced = True  # As in existing direct deployments, skip optional mDNS sync.
+        await self._worker_loop()
+
+    async def _discovery_loop(self) -> None:
+        self.discovery.on_discovery = self._on_coordinator_discovered
+        self.discovery.on_removal = self._on_coordinator_removed
+        try:
+            self.discovery.start()
+            await self._worker_loop()
+        finally:
+            self.discovery.on_discovery = None
+            self.discovery.on_removal = None
+            self.discovery.stop()
+            self.coordinator = None
+            self.is_synced = False
+
+    async def _heartbeat(self, base_url: str) -> None:
+        while True:
+            try:
+                await self.http_client.post(
+                    f"{base_url}/api/heartbeat", params={"worker_id": self.node_id},
+                    headers={"X-API-Key": self.api_key}, timeout=5,
+                )
+            except httpx.HTTPError:
+                pass  # The active task uses the same retry/reassignment protocol after an outage.
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
 
     def _on_coordinator_discovered(self, node: NodeInfo) -> None:
         """Handle coordinator discovery."""
-        print(f"✅ Found coordinator: {node.hostname} ({node.address}:{node.port})")
+        if node.node_type != "coordinator":
+            return
+        if self.coordinator and self.coordinator.node_id != node.node_id:
+            return
         print(f"✅ Found coordinator: {node.hostname} ({node.address}:{node.port})")
         self.coordinator = node
         self.is_synced = False  # Reset sync state on new coordinator
@@ -186,13 +224,19 @@ class WorkerNode:
         if self.coordinator and self.coordinator.node_id == node.node_id:
             print(f"⚠️  Coordinator {node.hostname} disconnected")
             self.coordinator = None
+            self.is_synced = False
+            candidates = self.discovery.get_nodes("coordinator")
+            if candidates:
+                self._on_coordinator_discovered(candidates[0])
 
     async def _request_and_render_task(self) -> None:
         """Request a task from coordinator and render it."""
         if not self.coordinator:
             return
 
-        base_url = f"http://{self.coordinator.address}:{self.coordinator.port}"
+        base_url = self.coordinator.base_url
+        task_data = None
+        heartbeat = None
 
         try:
             # Request a task with API key
@@ -204,13 +248,16 @@ class WorkerNode:
                     "worker_id": self.node_id,
                     "worker_name": self.name,
                     "cpu_cores": self.specs.cpu_cores,
-                    "gpu_name": self.specs.gpu_name or "None",
+                    "ram_gb": self.specs.ram_gb,
+                    "gpu_name": self.gpu_name,
+                    "blender_version": self.blender_version,
                 },
                 headers=headers,
             ) as response:
                 if response.status_code == 204:
                     # No tasks available
-                    await asyncio.sleep(2)
+                    if self.is_running:
+                        await asyncio.sleep(2)
                     return
 
                 if response.status_code != 200:
@@ -218,7 +265,10 @@ class WorkerNode:
                     await asyncio.sleep(5)
                     return
 
-                task_data = await response.json()
+                await response.aread()
+                task_data = response.json()
+
+            heartbeat = asyncio.create_task(self._heartbeat(base_url))
 
             print(f"\n📦 Received task: Frame {task_data['frame_number']}")
 
@@ -230,45 +280,41 @@ class WorkerNode:
             )
 
             if not blend_path:
-                print(f"❌ Failed to download blend file")
-                await self._report_task_failure(task_data, "Failed to download blend file")
+                print("❌ Failed to download blend file")
+                await self._report_task_failure(task_data, "Failed to download blend file", base_url=base_url)
                 return
 
-            # Set rendering state for bandwidth management
-            self.bandwidth_manager.set_rendering_state(True)
+            with tempfile.TemporaryDirectory(prefix="frame-", dir=self.temp_dir) as directory:
+                self.bandwidth_manager.set_rendering_state(True)
+                try:
+                    result = await asyncio.to_thread(
+                        self.blender.render_frame,
+                        blend_path, task_data["frame_number"], Path(directory),
+                        output_format=task_data.get("output_format", "PNG"),
+                        render_settings=task_data.get("render_settings"),
+                    )
+                finally:
+                    self.bandwidth_manager.set_rendering_state(False)
 
-            try:
-                # Render the frame
-                output_dir = self.temp_dir / task_data["job_id"]
-                output_dir.mkdir(exist_ok=True)
+                if result.success:
+                    print(f"✅ Rendered frame {result.frame} in {result.render_time:.1f}s")
+                    await self._upload_result(base_url, task_data, result.output_file, result.render_time)
+                else:
+                    print(f"❌ Render failed: {result.error_message}")
+                    await self._report_task_failure(task_data, result.error_message or "Render failed", base_url=base_url)
 
-                result = self.blender.render_frame(
-                    blend_path,
-                    task_data["frame_number"],
-                    output_dir,
-                )
-            finally:
-                self.bandwidth_manager.set_rendering_state(False)
-
-            if result.success:
-                print(f"✅ Rendered frame {result.frame} in {result.render_time:.1f}s")
-
-                # Upload result
-                await self._upload_result(
-                    base_url,
-                    task_data,
-                    result.output_file,
-                    result.render_time,
-                )
-            else:
-                print(f"❌ Render failed: {result.error_message}")
-                await self._report_task_failure(task_data, result.error_message or "Render failed")
-
-        except httpx.ConnectError:
-            print(f"❌ Cannot connect to coordinator")
-            self.coordinator = None
+        except TaskReportTimeout as exc:
+            print(f"❌ {exc}; releasing heartbeat so the assignment can expire")
+        except httpx.RequestError as exc:
+            print(f"❌ Coordinator request failed: {exc}")
         except Exception as e:
             print(f"❌ Error rendering task: {e}")
+            if isinstance(task_data, dict) and "id" in task_data and "frame_number" in task_data:
+                await self._report_task_failure(task_data, str(e), base_url=base_url)
+        finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
 
     async def _download_blend_file(
         self,
@@ -287,80 +333,38 @@ class WorkerNode:
         Returns:
             Path to downloaded blend file, or None if failed
         """
-        # Check if we already have the file
-        blend_dir = self.temp_dir / "blend_files"
-        blend_dir.mkdir(exist_ok=True)
-        local_path = blend_dir / f"{file_hash}.blend"
-
-        if local_path.exists():
-            return local_path
-
-        # Download file with API key and optimization
         try:
+            new_file_hasher(file_hash)  # Validate before using the digest as a filename.
+            file_hash = file_hash.lower()
+            blend_dir = self.temp_dir / "blend_files"
+            blend_dir.mkdir(exist_ok=True)
+            local_path = blend_dir / f"{file_hash}.blend"
+            if local_path.exists():
+                if await asyncio.to_thread(matches_file_hash, local_path, file_hash):
+                    return local_path
+                local_path.unlink()
+
             headers = {"X-API-Key": self.api_key}
             url = f"{base_url}/api/jobs/{job_id}/blend"
+            chunked = ChunkedTransfer(url, local_path)
+            file_size = await chunked.get_file_size(self.http_client, headers)
+            if file_size > CHUNKED_THRESHOLD:
+                try:
+                    if await asyncio.wait_for(chunked.download(
+                        self.http_client, headers, expected_hash=file_hash, total_size=file_size
+                    ), timeout=DOWNLOAD_TIMEOUT):
+                        return local_path
+                except asyncio.TimeoutError:
+                    pass
+                print("⚠️ Ranged download failed; trying one full download")
 
-            # Check file size first to decide on transfer method
-            try:
-                head_response = await self.http_client.head(url, headers=headers)
-                file_size = 0
-                if "Content-Length" in head_response.headers:
-                    file_size = int(head_response.headers["Content-Length"])
-            except Exception:
-                file_size = 0
-
-            # Use chunked transfer for large files (>50MB)
-            if file_size > 50 * 1024 * 1024:
-                print(f"📦 Using chunked transfer for large file ({file_size / (1024*1024):.1f} MB)")
-                chunked = ChunkedTransfer(
-                    url=url,
-                    output_path=local_path,
-                    chunk_size=10 * 1024 * 1024,  # 10 MB chunks
-                    max_parallel_chunks=4,
-                )
-
-                def progress_callback(progress):
-                    if progress.total_bytes > 0:
-                        percent = (progress.downloaded_bytes / progress.total_bytes) * 100
-                        print(f"📥 Download progress: {percent:.1f}% ({progress.chunks_completed}/{progress.chunks_total} chunks)")
-
-                success = await chunked.download(
-                    self.http_client,
-                    headers=headers,
-                    progress_callback=progress_callback,
-                )
-
-                if success:
-                    print(f"📥 Downloaded blend file: {file_hash}")
-                    return local_path
-                else:
-                    print(f"❌ Chunked download failed")
-                    if local_path.exists():
-                        local_path.unlink()
-                    return None
-            else:
-                # Use optimized transfer for smaller files
-                stats = await self.transfer_optimizer.download_file(
-                    self.http_client,
-                    url,
-                    local_path,
-                    priority=TransferPriority.HIGH,
-                    compression=None,  # Let it auto-detect
-                    headers=headers,
-                )
-
-                if stats.bytes_transferred > 0:
-                    print(f"📥 Downloaded blend file: {file_hash} ({stats.bytes_transferred / (1024*1024):.1f} MB in {stats.elapsed_time:.1f}s)")
-                    if stats.compression_ratio:
-                        print(f"   Compression ratio: {stats.compression_ratio:.2%}")
-                    return local_path
-                else:
-                    return None
-
-        except Exception as e:
+            await asyncio.wait_for(self.transfer_optimizer.download_file(
+                self.http_client, url, local_path, priority=TransferPriority.HIGH,
+                headers=headers, expected_hash=file_hash, expected_size=file_size or None,
+            ), timeout=DOWNLOAD_TIMEOUT)
+            return local_path
+        except (OSError, ValueError, httpx.HTTPError, asyncio.TimeoutError) as e:
             print(f"❌ Error downloading blend file: {e}")
-            if local_path.exists():
-                local_path.unlink()
             return None
 
     async def _upload_result(
@@ -385,7 +389,8 @@ class WorkerNode:
                     f"{base_url}/api/tasks/{task_data['id']}/complete",
                     data={"render_time": str(render_time),
                           "assignment": task_data.get("assignment", "")},
-                    files={"output": (output_file.name, f, "image/png")},
+                    files={"output": (output_file.name, f,
+                                      mimetypes.guess_type(output_file.name)[0] or "application/octet-stream")},
                     headers={"X-API-Key": self.api_key},
                 )
 
@@ -394,15 +399,24 @@ class WorkerNode:
                 raise FileNotFoundError("Blender returned no output file")
             response = await self._retry_task_report(send, task_data, "upload")
         except OSError as exc:
-            await self._report_task_failure(task_data, f"Cannot read output: {exc!r}")
+            await self._report_task_failure(task_data, f"Cannot read output: {exc!r}", base_url=base_url)
             return
         if response.is_success:
             print(f"📤 Uploaded result for frame {task_data['frame_number']}")
         elif response.status_code not in {404, 409}:
-            await self._report_task_failure(task_data, f"Upload refused: HTTP {response.status_code}")
+            await self._report_task_failure(task_data, f"Upload refused: HTTP {response.status_code}", base_url=base_url)
 
     async def _retry_task_report(self, send, task_data: dict, operation: str) -> httpx.Response:
         """Keep the rendered result while the coordinator is temporarily unreachable."""
+        try:
+            return await asyncio.wait_for(
+                self._retry_report_until_cancelled(send, task_data, operation),
+                timeout=TASK_REPORT_TIMEOUT,
+            )
+        except asyncio.TimeoutError as exc:
+            raise TaskReportTimeout(f"Frame {task_data['frame_number']} {operation} timed out") from exc
+
+    async def _retry_report_until_cancelled(self, send, task_data, operation):
         delay = 1
         while True:
             try:
@@ -416,7 +430,7 @@ class WorkerNode:
             await asyncio.sleep(delay)
             delay = min(delay * 2, 30)
 
-    async def _report_task_failure(self, task_data: dict, error: str) -> None:
+    async def _report_task_failure(self, task_data: dict, error: str, *, base_url: Optional[str] = None) -> None:
         """
         Report task failure to coordinator.
 
@@ -424,10 +438,10 @@ class WorkerNode:
             task_data: Task data
             error: Error message
         """
-        if not self.coordinator:
-            return
-
-        base_url = f"http://{self.coordinator.address}:{self.coordinator.port}"
+        if base_url is None:
+            if not self.coordinator:
+                return
+            base_url = self.coordinator.base_url
 
         async def send():
             return await self.http_client.post(
@@ -435,7 +449,11 @@ class WorkerNode:
                 json={"error": error, "assignment": task_data.get("assignment")},
                 headers={"X-API-Key": self.api_key},
             )
-        response = await self._retry_task_report(send, task_data, "failure report")
+        try:
+            response = await self._retry_task_report(send, task_data, "failure report")
+        except TaskReportTimeout as exc:
+            print(f"❌ {exc}; releasing heartbeat so the assignment can expire")
+            return
         if not response.is_success:
             print(f"❌ Failure report for frame {task_data['frame_number']}: HTTP {response.status_code}")
 
@@ -445,11 +463,11 @@ class WorkerNode:
             return
 
         print("\n🔄 Syncing with coordinator...")
-        base_url = f"http://{self.coordinator.address}:{self.coordinator.port}"
+        coordinator = self.coordinator
+        base_url = coordinator.base_url
 
         try:
-            # 1. Get Manifest (no auth needed for sync endpoints)
-            response = await self.http_client.get(f"{base_url}/api/sync/manifest")
+            response = await self.http_client.get(f"{base_url}/api/sync/manifest", headers={"X-API-Key": self.api_key})
             if response.status_code != 200:
                 print(f"⚠️  Failed to get sync manifest: {response.status_code}")
                 # We can still proceed, maybe just retry later
@@ -465,8 +483,9 @@ class WorkerNode:
             # 3. Sync Add-ons
             await self._sync_addons(base_url, manifest.get("addons_hash"))
 
-            self.is_synced = True
-            print("✅ Synchronization complete")
+            if self.coordinator is coordinator:
+                self.is_synced = True
+                print("✅ Synchronization complete")
 
         except Exception as e:
             print(f"❌ Sync failed: {e}")
@@ -475,7 +494,7 @@ class WorkerNode:
     async def _sync_settings(self, base_url: str) -> None:
         """Download and apply global settings."""
         try:
-            response = await self.http_client.get(f"{base_url}/api/sync/settings")
+            response = await self.http_client.get(f"{base_url}/api/sync/settings", headers={"X-API-Key": self.api_key})
             if response.status_code == 200:
                 self.settings = response.json()
                 print("📥 Global settings applied")
@@ -489,7 +508,7 @@ class WorkerNode:
         """Download and install missing add-ons."""
         try:
             # Get list of add-ons
-            response = await self.http_client.get(f"{base_url}/api/sync/addons")
+            response = await self.http_client.get(f"{base_url}/api/sync/addons", headers={"X-API-Key": self.api_key})
             if response.status_code != 200:
                 return
 
@@ -526,10 +545,10 @@ class WorkerNode:
     async def _download_and_install_addon(self, base_url: str, addon_info: dict, target_path: Path) -> None:
         """Download and install a specific add-on."""
         try:
-            # Note: Sync endpoints don't require authentication for now
             async with self.http_client.stream(
                 "GET", 
-                f"{base_url}/api/sync/addons/{addon_info['name']}/download"
+                f"{base_url}/api/sync/addons/{addon_info['name']}/download",
+                headers={"X-API-Key": self.api_key},
             ) as response:
                 if response.status_code != 200:
                     print(f"❌ Failed to download {addon_info['name']}")

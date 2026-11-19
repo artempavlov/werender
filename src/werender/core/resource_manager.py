@@ -1,5 +1,6 @@
 """Resource management for WeRender."""
 
+import math
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,6 +34,16 @@ class WorkerResourceLimits:
 
     tags: Set[str] = field(default_factory=set)
     """Worker tags/groups."""
+
+    def __post_init__(self):
+        if type(self.max_concurrent_tasks) is not int or self.max_concurrent_tasks not in (0, 1):
+            raise ValueError("Workers support at most one concurrent task (0 disables assignment)")
+        if self.cpu_utilization_cap != 1.0 or self.gpu_utilization_cap != 1.0:
+            raise ValueError("CPU/GPU utilization caps are not supported")
+        if self.max_memory_per_task_gb is not None and (
+            not math.isfinite(self.max_memory_per_task_gb) or self.max_memory_per_task_gb <= 0
+        ):
+            raise ValueError("Memory limit must be a positive number")
 
 
 @dataclass
@@ -71,6 +82,7 @@ class ResourceManager:
         self.worker_limits: Dict[str, WorkerResourceLimits] = {}
         self.check_disk_path = check_disk_path or Path.home() / ".werender"
         self.last_disk_check: Optional[datetime] = None
+        self._last_disk_result: tuple[bool, Optional[str]] = (True, None)
 
     def set_worker_limits(self, worker_id: str, limits: WorkerResourceLimits) -> None:
         """Set resource limits for a worker."""
@@ -166,22 +178,23 @@ class ResourceManager:
             self.last_disk_check
             and now - self.last_disk_check < self.coordinator_limits.disk_space_check_interval
         ):
-            return True, None  # Assume OK if recently checked
+            return self._last_disk_result
 
         try:
             total, used, free = shutil.disk_usage(self.check_disk_path)
             free_gb = free / (1024 ** 3)
 
-            self.last_disk_check = now
-
             if free_gb < self.coordinator_limits.min_disk_space_gb:
-                return False, f"Insufficient disk space ({free_gb:.1f}GB < {self.coordinator_limits.min_disk_space_gb}GB required)"
-
-            return True, None
-        except Exception as e:
-            # If we can't check, assume OK but log warning
-            print(f"⚠️  Warning: Could not check disk space: {e}")
-            return True, None
+                self._last_disk_result = (
+                    False, f"Insufficient disk space ({free_gb:.1f}GB < "
+                    f"{self.coordinator_limits.min_disk_space_gb}GB required)",
+                )
+            else:
+                self._last_disk_result = (True, None)
+            self.last_disk_check = now
+            return self._last_disk_result
+        except OSError:
+            return False, "Could not check coordinator disk space"
 
     def get_disk_space_info(self) -> Dict[str, float]:
         """

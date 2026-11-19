@@ -1,9 +1,9 @@
 """Intelligent scheduler for WeRender job distribution."""
 
 from enum import Enum
-from typing import Optional, Callable, TYPE_CHECKING
+import re
+from typing import Optional, TYPE_CHECKING
 from dataclasses import dataclass
-from datetime import datetime
 
 from werender.core.job import RenderJob, FrameTask, TaskStatus
 
@@ -70,7 +70,13 @@ class WorkerCapabilities:
         """
         # Check Blender version compatibility
         if job.blender_version and self.blender_version:
-            if job.blender_version != self.blender_version:
+            required = re.match(r"^(\d+\.\d+)\b", job.blender_version)
+            actual = re.match(r"^(\d+\.\d+)\b", self.blender_version)
+            compatible = (
+                required.group(1) == actual.group(1)
+                if required and actual else job.blender_version == self.blender_version
+            )
+            if not compatible:
                 return False, f"Blender version mismatch: {job.blender_version} vs {self.blender_version}"
 
         # Check if worker is idle
@@ -117,6 +123,12 @@ class TaskScheduler:
         self.strategy = strategy
         self.chunking = chunking
         self.worker_stats: dict[str, dict] = {}  # Track worker performance
+        self._last_assignment: dict[str, int] = {}
+        self._assignments = 0
+
+    def record_assignment(self, worker_id: str) -> None:
+        self._assignments += 1
+        self._last_assignment[worker_id] = self._assignments
 
     def select_worker(
         self,
@@ -152,15 +164,14 @@ class TaskScheduler:
                 continue
 
             # Check job requirements if provided
-            if job_requirements:
-                if job_requirements.requires_gpu and not capabilities.gpu_name or capabilities.gpu_name == "None":
-                    continue
-                if job_requirements.min_memory_gb and capabilities.ram_gb:
-                    if capabilities.ram_gb < job_requirements.min_memory_gb:
-                        continue
-                if job_requirements.worker_tags:
-                    if not job_requirements.worker_tags.intersection(capabilities.tags):
-                        continue
+            requirements = job_requirements or job
+            gpu = capabilities.gpu_name.strip().casefold()
+            if requirements.requires_gpu and gpu in {"", "none", "cpu", "n/a", "unknown"}:
+                continue
+            if requirements.min_memory_gb and (capabilities.ram_gb or 0) < requirements.min_memory_gb:
+                continue
+            if not requirements.worker_tags.issubset(capabilities.tags):
+                continue
 
             available_workers.append((worker_id, capabilities))
 
@@ -187,6 +198,9 @@ class TaskScheduler:
             worker_id=worker_id,
             cpu_cores=worker_info.cpu_cores,
             gpu_name=worker_info.gpu_name,
+            blender_version=getattr(worker_info, "blender_version", ""),
+            ram_gb=getattr(worker_info, "ram_gb", None),
+            tags=getattr(worker_info, "tags", set()),
             current_task_id=worker_info.current_task_id,
             is_idle=worker_info.current_task_id is None,
             tasks_completed=stats.get("tasks_completed", 0),
@@ -195,17 +209,10 @@ class TaskScheduler:
 
     def _round_robin_select(self, workers: list[tuple[str, WorkerCapabilities]]) -> str:
         """Round-robin selection: cycle through workers."""
-        # Sort by worker_id for consistent ordering
-        workers.sort(key=lambda x: x[0])
-        
-        # Find worker with least recent assignment
-        # For simplicity, just pick the first idle one
-        for worker_id, capabilities in workers:
-            if capabilities.is_idle:
-                return worker_id
-        
-        # If all busy, return first one
-        return workers[0][0]
+        return min(workers, key=lambda pair: self._assignment_order(pair[0]))[0]
+
+    def _assignment_order(self, worker_id: str) -> tuple[int, str]:
+        return self._last_assignment.get(worker_id, 0), worker_id
 
     def _performance_based_select(self, workers: list[tuple[str, WorkerCapabilities]]) -> str:
         """Performance-based: assign to fastest workers first."""
@@ -217,7 +224,7 @@ class TaskScheduler:
                 return (True, float('inf'))  # No stats = lowest priority
             return (False, caps.average_render_time)
 
-        workers.sort(key=sort_key)
+        workers.sort(key=lambda pair: (*sort_key(pair), self._assignment_order(pair[0])))
         
         # Prefer idle workers
         for worker_id, capabilities in workers:
@@ -229,7 +236,7 @@ class TaskScheduler:
     def _fair_distribution_select(self, workers: list[tuple[str, WorkerCapabilities]]) -> str:
         """Fair distribution: ensure all workers get equal work."""
         # Sort by tasks completed (ascending)
-        workers.sort(key=lambda x: x[1].tasks_completed)
+        workers.sort(key=lambda pair: (pair[1].tasks_completed, self._assignment_order(pair[0])))
         
         # Prefer idle workers with least tasks
         for worker_id, capabilities in workers:
@@ -258,7 +265,7 @@ class TaskScheduler:
             return 0.6 * perf_score + 0.4 * fairness_score
 
         # Sort by score (descending)
-        workers.sort(key=lambda x: calculate_score(x[0], x[1]), reverse=True)
+        workers.sort(key=lambda pair: (-calculate_score(*pair), self._assignment_order(pair[0])))
         
         # Prefer idle workers
         for worker_id, capabilities in workers:

@@ -6,7 +6,18 @@ from pathlib import Path
 from typing import Optional, Set
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+MAX_JOB_FRAMES = 100_000
+MAX_FRAME_NUMBER = 1_048_574  # Blender's frame limit.
+MAX_FRAME_ATTEMPTS = 3
+
+
+def validate_frame_range(start: int, end: int) -> None:
+    if not -MAX_FRAME_NUMBER <= start <= end <= MAX_FRAME_NUMBER:
+        raise ValueError("Invalid frame range: start must precede end within Blender's limits")
+    if end - start + 1 > MAX_JOB_FRAMES:
+        raise ValueError(f"Frame range exceeds {MAX_JOB_FRAMES} frames")
 
 
 class TaskStatus(str, Enum):
@@ -31,7 +42,7 @@ class TaskStatus(str, Enum):
 class FrameTask(BaseModel):
     """A single frame render task."""
 
-    id: str = Field(default_factory=lambda: str(uuid4())[:8])
+    id: str = Field(default_factory=lambda: uuid4().hex)
     """Unique task identifier."""
 
     frame_number: int
@@ -60,6 +71,9 @@ class FrameTask(BaseModel):
 
     render_time_seconds: Optional[float] = None
     """Time taken to render the frame."""
+
+    failures: int = 0
+    last_failed_assignment: Optional[str] = None
 
     def assign_to(self, worker_id: str) -> None:
         """Assign this task to a worker."""
@@ -95,6 +109,8 @@ class FrameTask(BaseModel):
         self.started_at = None
         self.completed_at = None
         self.error_message = None
+        self.output_file = None
+        self.render_time_seconds = None
 
 
 class JobStatus(str, Enum):
@@ -122,7 +138,7 @@ class JobStatus(str, Enum):
 class RenderJob(BaseModel):
     """A complete render job containing multiple frame tasks."""
 
-    id: str = Field(default_factory=lambda: str(uuid4())[:8])
+    id: str = Field(default_factory=lambda: uuid4().hex)
     """Unique job identifier."""
 
     name: str = ""
@@ -133,6 +149,10 @@ class RenderJob(BaseModel):
 
     packed_file: Optional[Path] = None
     """Path to the packed .blend file (with embedded assets)."""
+
+    blend_file_hash: Optional[str] = None
+
+    database_metadata: dict = Field(default_factory=dict, exclude=True)
 
     frame_start: int
     """First frame to render."""
@@ -180,8 +200,14 @@ class RenderJob(BaseModel):
     scheduled_time: Optional[datetime] = None
     """When to start this job (for scheduled jobs)."""
 
+    @model_validator(mode="after")
+    def _validate_frames(self):
+        validate_frame_range(self.frame_start, self.frame_end)
+        return self
+
     def create_tasks(self) -> None:
         """Create frame tasks for all frames in the range."""
+        validate_frame_range(self.frame_start, self.frame_end)
         self.tasks = [
             FrameTask(frame_number=frame)
             for frame in range(self.frame_start, self.frame_end + 1)
@@ -223,8 +249,7 @@ class RenderJob(BaseModel):
 
     def get_next_task(self) -> Optional[FrameTask]:
         """Get the next pending task, if any."""
-        pending = self.pending_tasks
-        return pending[0] if pending else None
+        return next((t for t in self.tasks if t.status == TaskStatus.PENDING), None)
 
     def start(self) -> None:
         """Mark job as running."""
@@ -241,6 +266,6 @@ class RenderJob(BaseModel):
 
     def check_completion(self) -> None:
         """Check if job is complete and update status."""
-        if all(t.status == TaskStatus.COMPLETED for t in self.tasks):
-            self.status = JobStatus.COMPLETED
+        if self.tasks and all(t.status in (TaskStatus.COMPLETED, TaskStatus.FAILED) for t in self.tasks):
+            self.status = JobStatus.COMPLETED if self.completed_frames == len(self.tasks) else JobStatus.FAILED
             self.completed_at = datetime.now()

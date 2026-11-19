@@ -56,12 +56,30 @@ That's it! The worker will:
 
 Open `http://localhost:8420` on your Coordinator machine (or use its local IP, e.g., `http://192.168.1.5:8420`, to view from your phone).
 
+Enter the `coordinator` value from `~/.werender/api_keys.json` and select **Connect**.
+The dashboard keeps the key in memory until you reload or close the page. Select
+**Forget key** to clear it without reloading. If your authenticated proxy injects
+the key, leave the field blank. Use HTTPS outside localhost or a trusted private network.
+
 ### Features
 
 - **Overview**: See active workers, CPU/RAM usage, and overall progress.
 - **Jobs**: Upload new `.blend` files or restart previous jobs.
 - **Workers**: View detailed stats of every connected node.
-- **Results**: Preview rendered frames as they come in.
+
+### Submit from Blender
+
+1. Install `src/werender/addons/werender_submitter.py` using Blender's Add-ons preferences and enable it.
+2. Set the coordinator host, port, and API key in the add-on preferences. Enable **Use HTTPS**
+   if your endpoint uses TLS. Blender can save add-on preferences to disk; to avoid saving the key
+   there, leave the field blank and set `WERENDER_COORDINATOR_API_KEY` in Blender's environment.
+3. Save the project. In **Render Properties → WeRender**, choose the frame range and select
+   **Submit Job**. The add-on uploads a temporary copy of the current working state without
+   switching away from or overwriting the original file. Blender waits for the upload to finish.
+
+Pack external assets in Blender before submitting, or select **Pack Resources in Current Scene**
+to pack them in the open scene before saving the copy. That option changes the scene in memory.
+If the upload times out, check the dashboard before retrying to avoid a duplicate job.
 
 ---
 

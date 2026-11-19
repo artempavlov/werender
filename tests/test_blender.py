@@ -55,7 +55,9 @@ class TestBlenderRenderer:
             assert renderer._format_to_extension("PNG") == ".png"
             assert renderer._format_to_extension("JPEG") == ".jpg"
             assert renderer._format_to_extension("OPEN_EXR") == ".exr"
-            assert renderer._format_to_extension("unknown") == ".png"  # Default
+            assert renderer._format_to_extension("EXR") == ".exr"
+            with pytest.raises(ValueError, match="Unsupported render output format"):
+                renderer._format_to_extension("unknown")
 
 
 class TestRenderFrame:
@@ -71,12 +73,12 @@ class TestRenderFrame:
 
             with patch("shutil.which", return_value="/usr/bin/blender"):
                 with patch("subprocess.run") as mock_run:
-                    # Simulate subprocess completion
-                    mock_run.return_value = MagicMock(returncode=0, stderr="")
-                    
-                    # Create the output file to simulate Blender's output
-                    expected_output.parent.mkdir(parents=True, exist_ok=True)
-                    expected_output.write_bytes(b"fake png data")
+                    def write_frame(command, **kwargs):
+                        target = Path(command[command.index("-o") + 1]).with_name(expected_output.name)
+                        target.write_bytes(b"fake png data")
+                        return MagicMock(returncode=0, stdout="", stderr="")
+
+                    mock_run.side_effect = write_frame
 
                     renderer = BlenderRenderer()
                     result = renderer.render_frame(

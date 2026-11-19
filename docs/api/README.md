@@ -1,6 +1,6 @@
 # WeRender API Reference
 
-This document provides an overview of the WeRender HTTP and WebSocket APIs.
+This document provides an overview of the WeRender HTTP API.
 
 ## Base URL
 
@@ -12,7 +12,8 @@ http://<coordinator-ip>:8420
 
 ## Authentication
 
-Worker endpoints require an API key in the `X-API-Key` header:
+Protected endpoints require an API key in the `X-API-Key` header. Use the coordinator
+key for job management and dashboard polling, and the worker key for render task requests:
 
 ```http
 X-API-Key: your_worker_api_key
@@ -29,11 +30,11 @@ See the [Security Guide](../security/SECURITY_GUIDE.md) for setup details.
 | Method   | Endpoint                   | Description               |
 | -------- | -------------------------- | ------------------------- |
 | `GET`    | `/api/jobs`                | List all jobs             |
-| `POST`   | `/api/jobs`                | Create a new job          |
+| `POST`   | `/api/jobs/create`         | Create a job with multipart fields `file`, `name` (optional), `frame_start`, and `frame_end` |
 | `GET`    | `/api/jobs/{job_id}`       | Get job details           |
 | `POST`   | `/api/jobs/{job_id}/start` | Start a job               |
 | `POST`   | `/api/jobs/{job_id}/pause` | Pause a job               |
-| `DELETE` | `/api/jobs/{job_id}`       | Delete a job              |
+| `POST`   | `/api/jobs/{job_id}/cancel` | Cancel a job             |
 | `GET`    | `/api/jobs/{job_id}/blend` | Download blend file (auth required) |
 
 ### Tasks
@@ -52,28 +53,6 @@ See the [Security Guide](../security/SECURITY_GUIDE.md) for setup details.
 
 ---
 
-## WebSocket
-
-### Endpoint
-
-```text
-ws://<coordinator-ip>:8420/ws
-```
-
-### Message Types
-
-**Worker → Coordinator:**
-
-- `heartbeat` - Worker status and resource usage
-- `log` - Render progress logs
-
-**Coordinator → Worker:**
-
-- `job_update` - New job available
-- `cancel` - Cancel current task
-
----
-
 ## Dashboard
 
 The web dashboard is served at the root URL:
@@ -82,4 +61,5 @@ The web dashboard is served at the root URL:
 http://<coordinator-ip>:8420/
 ```
 
-Access from any browser on the network to monitor render progress.
+The dashboard polls the HTTP API. Enter a coordinator key or use an authenticated
+reverse proxy that injects the appropriate key server-side without exposing it to the browser.

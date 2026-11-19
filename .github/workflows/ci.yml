@@ -1,0 +1,46 @@
+name: Checks
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install '.[dev]'
+      - name: Run tests with disposable credentials and job state
+        run: |
+          mkdir -p "$RUNNER_TEMP/werender-test-home"
+          HOME="$RUNNER_TEMP/werender-test-home" python -m pytest
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install build twine
+      - run: python -m build --outdir "${RUNNER_TEMP}/werender-dist"
+      - run: python -m twine check --strict "${RUNNER_TEMP}/werender-dist/"*
+      - name: Smoke-test the built wheel outside the checkout
+        run: |
+          python -m pip install "${RUNNER_TEMP}/werender-dist/"*.whl
+          cd "$RUNNER_TEMP"
+          werender --help
+          python - <<'PY'
+          from importlib.resources import files
+
+          package = files('werender')
+          for path in ('dashboard/index.html', 'dashboard/app.js', 'addons/werender_submitter.py'):
+              assert package.joinpath(*path.split('/')).is_file(), path
+          PY

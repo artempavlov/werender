@@ -2,7 +2,6 @@
 
 import os
 import secrets
-import hashlib
 import time
 from pathlib import Path
 from typing import Optional
@@ -161,18 +160,21 @@ class AuthManager:
         print("=" * 60 + "\n")
 
 
-def get_api_key_dependency(auth_manager: AuthManager, key_type: Optional[str] = None):
+def get_api_key_dependency(
+    auth_manager: AuthManager, key_type: str | tuple[str, ...] | None = None
+):
     """
     Create a FastAPI dependency for API key authentication.
 
     Args:
         auth_manager: The authentication manager instance
-        key_type: Required key type (e.g., 'coordinator', 'worker')
+        key_type: Accepted key type or tuple of acceptable key types
 
     Returns:
         A FastAPI dependency function
     """
     api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+    allowed_types = key_type if isinstance(key_type, tuple) else (key_type,)
 
     async def verify_api_key(api_key: Optional[str] = Security(api_key_header)):
         if api_key is None:
@@ -181,7 +183,7 @@ def get_api_key_dependency(auth_manager: AuthManager, key_type: Optional[str] = 
                 detail="API key required. Provide X-API-Key header.",
             )
 
-        if not auth_manager.validate_key(api_key, key_type):
+        if not any(auth_manager.validate_key(api_key, role) for role in allowed_types):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Invalid API key",

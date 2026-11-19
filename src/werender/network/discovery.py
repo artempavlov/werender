@@ -1,15 +1,17 @@
 """Zeroconf/mDNS discovery for WeRender."""
 
 import asyncio
+import inspect
+import logging
 import socket
 import threading
 import time
-import logging
 from typing import Callable, Optional
 
-logger = logging.getLogger(__name__)
+import httpx
+from zeroconf import ServiceBrowser, ServiceInfo, ServiceStateChange, Zeroconf
 
-from zeroconf import ServiceBrowser, ServiceInfo, Zeroconf
+logger = logging.getLogger(__name__)
 
 SERVICE_TYPE = "_werender._tcp.local."
 SERVICE_NAME_BASE = "WeRender"
@@ -40,6 +42,10 @@ class NodeInfo:
     @property
     def hostname(self) -> str:
         return self.properties.get("hostname", "")
+
+    @property
+    def base_url(self) -> str:
+        return str(httpx.URL(scheme="http", host=self.address.strip("[]"), port=self.port))
 
     @property
     def blender_version(self) -> str:
@@ -75,11 +81,18 @@ class DiscoveryService:
         self.on_discovery: Optional[Callable[[NodeInfo], None]] = None
         self.on_removal: Optional[Callable[[NodeInfo], None]] = None
         self._lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
+        self._event_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._generation = 0
 
     def start(self) -> None:
-        thread = threading.Thread(target=self._start_sync, daemon=True)
-        thread.start()
-        time.sleep(0.1)
+        with self._lifecycle_lock:
+            if self.zeroconf is None:
+                try:
+                    self._event_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    self._event_loop = None
+                self._start_sync()
 
     def _start_sync(self) -> None:
         self.zeroconf = Zeroconf()
@@ -106,36 +119,45 @@ class DiscoveryService:
                 handlers=[self._on_service_state_change],
             )
         except Exception as e:
-            print(f"Error starting discovery service: {e}")
+            logger.warning("Error starting discovery service: %s", e)
+            self.stop()
 
     def stop(self) -> None:
-        if self.browser:
-            self.browser.cancel()
+        with self._lifecycle_lock:
+            self._generation += 1
+            browser, info, zeroconf = self.browser, self.service_info, self.zeroconf
             self.browser = None
-        if self.service_info and self.zeroconf:
-            self.zeroconf.unregister_service(self.service_info)
-        if self.zeroconf:
-            self.zeroconf.close()
+            self.service_info = None
             self.zeroconf = None
-        with self._lock:
-            self.discovered_nodes.clear()
+            try:
+                if browser:
+                    browser.cancel()
+                if info and zeroconf:
+                    zeroconf.unregister_service(info)
+            finally:
+                if zeroconf:
+                    zeroconf.close()
+                with self._lock:
+                    self.discovered_nodes.clear()
 
     def _on_service_state_change(
         self,
         zeroconf: Zeroconf,
         service_type: str,
         name: str,
-        state_change: str,
+        state_change: ServiceStateChange,
     ) -> None:
-        if state_change == "Added":
+        if zeroconf is not self.zeroconf:
+            return
+        if state_change in (ServiceStateChange.Added, ServiceStateChange.Updated):
             info = zeroconf.get_service_info(service_type, name)
-            if info:
+            if info and zeroconf is self.zeroconf:
                 self._handle_service_added(info)
-        elif state_change == "Removed":
+        elif state_change is ServiceStateChange.Removed:
             self._handle_service_removed(name)
 
     def _handle_service_added(self, info: ServiceInfo) -> None:
-        if info.name == self.service_info.name:
+        if self.service_info and info.name == self.service_info.name:
             return
         properties = {}
         if info.properties:
@@ -146,9 +168,10 @@ class DiscoveryService:
                     logger.debug(f"Failed to decode property {key!r}: {e}")
         if properties.get("node_type") == self.node_type:
             return
-        if not info.addresses:
+        addresses = info.parsed_addresses()
+        if not addresses:
             return
-        address = socket.inet_ntoa(info.addresses[0])
+        address = addresses[0]
         node_type = properties.get("node_type", "unknown")
         node_info = NodeInfo(
             name=info.name,
@@ -158,12 +181,14 @@ class DiscoveryService:
             properties=properties,
         )
         with self._lock:
-            if node_info.node_id in self.discovered_nodes:
-                self.discovered_nodes[node_info.node_id].last_seen = time.time()
+            previous = self.discovered_nodes.get(node_info.node_id)
+            if previous and (previous.name, previous.address, previous.port, previous.properties) == (
+                node_info.name, node_info.address, node_info.port, node_info.properties
+            ):
+                previous.last_seen = time.time()
                 return
             self.discovered_nodes[node_info.node_id] = node_info
-        if self.on_discovery:
-            self.on_discovery(node_info)
+        self._notify(self.on_discovery, node_info)
 
     def _handle_service_removed(self, name: str) -> None:
         with self._lock:
@@ -173,9 +198,43 @@ class DiscoveryService:
                     node_to_remove = node_info
                     break
             if node_to_remove:
-                del self.discovered_nodes[node_to_remove]
-        if node_to_remove and self.on_removal:
-            self.on_removal(node_to_remove)
+                del self.discovered_nodes[node_to_remove.node_id]
+        if node_to_remove:
+            self._notify(self.on_removal, node_to_remove)
+
+    def _notify(self, callback, node: NodeInfo) -> None:
+        if not callback:
+            return
+        generation = self._generation
+
+        async def wait_for_callback(result):
+            try:
+                await result
+            except Exception:
+                logger.exception("Discovery callback failed for %s", node.name)
+
+        def invoke():
+            if generation != self._generation or not self.zeroconf:
+                return
+            try:
+                result = callback(node)
+                if inspect.isawaitable(result):
+                    if self._event_loop is None:
+                        if inspect.iscoroutine(result):
+                            result.close()
+                        logger.error("Async discovery callbacks require discovery to start in an event loop")
+                    else:
+                        self._event_loop.create_task(wait_for_callback(result))
+            except Exception:
+                logger.exception("Discovery callback failed for %s", node.name)
+
+        if self._event_loop is None:
+            invoke()
+        else:
+            try:
+                self._event_loop.call_soon_threadsafe(invoke)
+            except RuntimeError:
+                pass  # The event loop has already shut down.
 
     def get_nodes(self, node_type: Optional[str] = None) -> list[NodeInfo]:
         with self._lock:

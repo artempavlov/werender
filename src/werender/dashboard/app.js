@@ -1,17 +1,36 @@
-const { useState, useEffect, useCallback } = React;
+const { useState, useEffect } = React;
 
 // ============ API Helpers ============
 const API_BASE = '/api';
+const POLL_INTERVAL = 3000;
 
-async function apiRequest(endpoint, options = {}) {
-    const response = await fetch(`${API_BASE}${endpoint}`, options);
-    if (!response.ok) {
-        console.error('[DEBUG] API Error:', response.status, response.statusText);
-        const errorText = await response.text();
-        console.error('[DEBUG] API Error body:', errorText);
-        throw new Error(`API Error: ${response.status} - ${errorText}`);
+function apiError(status, body) {
+    let message = {
+        401: 'Enter the coordinator API key or sign in to your dashboard proxy.',
+        403: 'The coordinator denied access. Check that you are using the coordinator API key.',
+    }[status];
+    if (!message) {
+        try {
+            const detail = JSON.parse(body)?.detail;
+            if (typeof detail === 'string') message = detail;
+            if (Array.isArray(detail)) message = detail.map(item => item.msg).join('; ');
+        } catch { /* Only show the status for non-JSON error pages. */ }
     }
-    return response.json();
+    return Object.assign(new Error(message || `Coordinator returned HTTP ${status}.`), { status });
+}
+
+async function apiFetch(apiKey, endpoint, options = {}) {
+    const headers = new Headers(options.headers);
+    if (apiKey) headers.set('X-API-Key', apiKey);
+    const response = await fetch(`${API_BASE}${endpoint}`, {
+        ...options, headers, credentials: 'same-origin', redirect: 'error', cache: 'no-store',
+    });
+    if (!response.ok) throw apiError(response.status, await response.text());
+    return response;
+}
+
+async function apiRequest(apiKey, endpoint, options) {
+    return (await apiFetch(apiKey, endpoint, options)).json();
 }
 
 // ============ Components ============
@@ -233,7 +252,7 @@ function JobCard({ job, onStart, onPause, onResume, onCancel, onEdit, onDownload
     );
 }
 
-function CreateJobModal({ show, onHide, onCreate }) {
+function CreateJobModal({ show, onHide, apiKey }) {
     const [name, setName] = useState('');
     const [file, setFile] = useState(null);
     const [frameStart, setFrameStart] = useState(1);
@@ -258,12 +277,11 @@ function CreateJobModal({ show, onHide, onCreate }) {
             formData.append('frame_start', frameStart);
             formData.append('frame_end', frameEnd);
 
-            const result = await apiRequest('/jobs/create', {
+            await apiRequest(apiKey, '/jobs/create', {
                 method: 'POST',
                 body: formData,
             });
 
-            onCreate(result);
             setName('');
             setFile(null);
             setFrameStart(1);
@@ -372,7 +390,7 @@ function CreateJobModal({ show, onHide, onCreate }) {
     );
 }
 
-function EditJobModal({ show, onHide, job, onUpdate }) {
+function EditJobModal({ show, onHide, job, apiKey }) {
     const [frameStart, setFrameStart] = useState(job?.frame_start || 1);
     const [frameEnd, setFrameEnd] = useState(job?.frame_end || 100);
     const [loading, setLoading] = useState(false);
@@ -380,9 +398,7 @@ function EditJobModal({ show, onHide, job, onUpdate }) {
 
     // Update form values when job changes
     useEffect(() => {
-        console.log('[DEBUG] EditJobModal job prop:', job);
         if (job) {
-            console.log('[DEBUG] EditJobModal frame_start:', job.frame_start, 'frame_end:', job.frame_end);
             setFrameStart(job.frame_start);
             setFrameEnd(job.frame_end);
         }
@@ -402,41 +418,17 @@ function EditJobModal({ show, onHide, job, onUpdate }) {
 
         try {
             const requestBody = {
-                start_frame: frameStart,  // BUG FIX: Changed from frame_start to start_frame
-                end_frame: frameEnd,      // BUG FIX: Changed from frame_end to end_frame
+                start_frame: frameStart,
+                end_frame: frameEnd,
             };
-            console.log('[DEBUG] EditJobModal PATCH request body:', requestBody);
-            const result = await apiRequest(`/jobs/${job.id}`, {
+            await apiRequest(apiKey, `/jobs/${job.id}`, {
                 method: 'PATCH',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(requestBody),
             });
-            console.log('[DEBUG] EditJobModal PATCH response:', result);
-
-            onUpdate(result);
             onHide();
         } catch (err) {
-            // BUG FIX: Show actual error message from server
-            let errorMsg = 'Failed to update job';
-            if (err.message.includes('API Error:')) {
-                // Extract the actual error message from the API error
-                const match = err.message.match(/API Error: \d+ - (.+)/);
-                if (match && match[1]) {
-                    try {
-                        const errorData = JSON.parse(match[1]);
-                        if (errorData.detail) {
-                            errorMsg = errorData.detail;
-                        } else {
-                            errorMsg = match[1];
-                        }
-                    } catch (e) {
-                        errorMsg = match[1];
-                    }
-                }
-            } else {
-                errorMsg = err.message;
-            }
-            setError(errorMsg);
+            setError('Failed to update job: ' + err.message);
         } finally {
             setLoading(false);
         }
@@ -524,11 +516,10 @@ function EditJobModal({ show, onHide, job, onUpdate }) {
     );
 }
 
-function ReloadBlendModal({ show, onHide, job, onReload }) {
+function ReloadBlendModal({ show, onHide, job, apiKey }) {
     const [file, setFile] = useState(null);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState(null);
-    const [progress, setProgress] = useState(0);
 
     const handleSubmit = async (e) => {
         e.preventDefault();
@@ -539,58 +530,19 @@ function ReloadBlendModal({ show, onHide, job, onReload }) {
 
         setLoading(true);
         setError(null);
-        setProgress(0);
 
         try {
             const formData = new FormData();
-            formData.append('blend', file);  // BUG FIX: Changed from 'file' to 'blend'
-            console.log('[DEBUG] ReloadBlendModal FormData:', formData.get('blend'));
+            formData.append('blend', file);
 
-            // Use XMLHttpRequest for upload progress
-            const xhr = new XMLHttpRequest();
-
-            xhr.upload.addEventListener('progress', (e) => {
-                if (e.lengthComputable) {
-                    setProgress(Math.round((e.loaded / e.total) * 100));
-                }
+            await apiRequest(apiKey, `/jobs/${job.id}/reload_blend`, {
+                method: 'POST', body: formData,
             });
-
-            xhr.addEventListener('load', () => {
-                console.log('[DEBUG] ReloadBlendModal XHR status:', xhr.status);
-                console.log('[DEBUG] ReloadBlendModal XHR response:', xhr.responseText);
-                if (xhr.status >= 200 && xhr.status < 300) {
-                    const result = JSON.parse(xhr.responseText);
-                    onReload(result);
-                    setFile(null);
-                    setProgress(0);
-                    setLoading(false); // BUG FIX: Missing setLoading(false)
-                    onHide();
-                } else {
-                    // BUG FIX: Show actual error message from server
-                    let errorMsg = 'Failed to reload blend file';
-                    try {
-                        const errorData = JSON.parse(xhr.responseText);
-                        if (errorData.detail) {
-                            errorMsg = errorData.detail;
-                        }
-                    } catch (e) {
-                        // If not JSON, use status text
-                        errorMsg = `Server error: ${xhr.status} ${xhr.statusText}`;
-                    }
-                    setError(errorMsg);
-                    setLoading(false);
-                }
-            });
-
-            xhr.addEventListener('error', () => {
-                setError('Network error while uploading file');
-                setLoading(false);
-            });
-
-            xhr.open('POST', `${API_BASE}/jobs/${job.id}/reload_blend`);
-            xhr.send(formData);
+            setFile(null);
+            onHide();
         } catch (err) {
             setError('Failed to reload blend file: ' + err.message);
+        } finally {
             setLoading(false);
         }
     };
@@ -637,20 +589,6 @@ function ReloadBlendModal({ show, onHide, job, onReload }) {
                                     This will replace the existing blend file for this job
                                 </small>
                             </div>
-                            {loading && (
-                                <div className="mb-3">
-                                    <div className="d-flex justify-content-between mb-1">
-                                        <small>Uploading...</small>
-                                        <small>{progress}%</small>
-                                    </div>
-                                    <div className="progress" style={{ height: '8px' }}>
-                                        <div
-                                            className="progress-bar bg-info"
-                                            style={{ width: `${progress}%` }}
-                                        ></div>
-                                    </div>
-                                </div>
-                            )}
                         </div>
                         <div className="modal-footer">
                             <button type="button" className="btn btn-secondary" onClick={onHide} disabled={loading}>
@@ -733,147 +671,105 @@ function App() {
     const [jobs, setJobs] = useState([]);
     const [workers, setWorkers] = useState([]);
     const [addons, setAddons] = useState([]);
-    const [wsConnected, setWsConnected] = useState(false);
+    const [connection, setConnection] = useState({ apiKey: '' });
+    const { apiKey } = connection;
+    const [connected, setConnected] = useState(false);
+    const [pollError, setPollError] = useState(null);
+    const [actionError, setActionError] = useState(null);
+    const [addonsError, setAddonsError] = useState(null);
     const [showCreateModal, setShowCreateModal] = useState(false);
     const [showEditModal, setShowEditModal] = useState(false);
     const [showReloadModal, setShowReloadModal] = useState(false);
     const [selectedJob, setSelectedJob] = useState(null);
     const [loading, setLoading] = useState(true);
 
-    // Fetch initial data
     useEffect(() => {
-        async function fetchData() {
+        const lifetime = new AbortController();
+        let timer;
+        async function poll() {
+            const request = new AbortController();
+            const abort = () => request.abort();
+            lifetime.signal.addEventListener('abort', abort, { once: true });
+            const deadline = setTimeout(abort, 10000);
+            let retry = true;
             try {
-                const [jobsData, workersData, addonsData] = await Promise.all([
-                    apiRequest('/jobs'),
-                    apiRequest('/workers'),
-                    apiRequest('/sync/addons').catch(e => {
-                        console.warn('Addons fetch failed', e);
-                        return [];
-                    }),
+                const options = { signal: request.signal };
+                const [jobsResult, workersResult, addonsResult] = await Promise.allSettled([
+                    apiRequest(connection.apiKey, '/jobs', options),
+                    apiRequest(connection.apiKey, '/workers', options),
+                    apiRequest(connection.apiKey, '/sync/addons', options),
                 ]);
-                setJobs(jobsData);
-                setWorkers(workersData);
-                setAddons(addonsData);
-            } catch (error) {
-                console.error('Failed to fetch initial data:', error);
+                if (lifetime.signal.aborted) return;
+
+                const failure = [jobsResult, workersResult].find(result => result.status === 'rejected');
+                if (failure) {
+                    const error = failure.reason;
+                    const denied = error.status === 401 || error.status === 403;
+                    setPollError(denied ? error.message : 'Cannot reach the coordinator. Retrying…');
+                    setConnected(false);
+                    setJobs([]);
+                    setWorkers([]);
+                    setAddons([]);
+                    if (denied) retry = false;
+                    return;
+                }
+
+                setJobs(jobsResult.value);
+                setWorkers(workersResult.value);
+                setAddons(addonsResult.status === 'fulfilled' ? addonsResult.value : []);
+                setAddonsError(addonsResult.status === 'rejected' ? 'Could not load add-ons.' : null);
+                setPollError(null);
+                setConnected(true);
             } finally {
-                setLoading(false);
+                clearTimeout(deadline);
+                lifetime.signal.removeEventListener('abort', abort);
+                if (!lifetime.signal.aborted) {
+                    setLoading(false);
+                    if (retry) timer = setTimeout(poll, POLL_INTERVAL);
+                }
             }
         }
-        fetchData();
-    }, []);
-
-    // WebSocket connection
-    useEffect(() => {
-        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
-
-        ws.onopen = () => {
-            console.log('WebSocket connected');
-            setWsConnected(true);
-        };
-
-        ws.onclose = () => {
-            console.log('WebSocket disconnected');
-            setWsConnected(false);
-        };
-
-        ws.onerror = (error) => {
-            console.error('WebSocket error:', error);
-            setWsConnected(false);
-        };
-
-        ws.onmessage = (event) => {
-            const data = JSON.parse(event.data);
-            console.log('[DEBUG] WebSocket update:', data);
-
-            if (data.jobs) {
-                setJobs(data.jobs);
-            }
-            if (data.workers) {
-                setWorkers(data.workers);
-            }
-            // Add-ons usually don't change often, but we could add a listener here if we wanted real-time updates for them too.
-        };
-
+        poll();
         return () => {
-            ws.close();
+            lifetime.abort();
+            clearTimeout(timer);
         };
-    }, []);
+    }, [connection]);
 
-    // ... (rest of handlers same as before)
-    // Job control handlers
-    const handleStartJob = async (jobId) => {
+    function connect(key) {
+        setLoading(true);
+        setConnected(false);
+        setPollError(null);
+        setActionError(null);
+        setJobs([]);
+        setWorkers([]);
+        setAddons([]);
+        setSelectedJob(null);
+        setShowCreateModal(false);
+        setShowEditModal(false);
+        setShowReloadModal(false);
+        setConnection({ apiKey: key });
+    }
+
+    async function controlJob(endpoint, action, confirmation) {
+        if (confirmation && !confirm(confirmation)) return;
+        setActionError(null);
         try {
-            await apiRequest(`/jobs/${jobId}/start`, { method: 'POST' });
+            await apiRequest(apiKey, endpoint, { method: 'POST' });
         } catch (error) {
-            console.error('Failed to start job:', error);
-            alert('Failed to start job');
+            setActionError(`Failed to ${action}: ${error.message}`);
         }
-    };
-
-    const handlePauseJob = async (jobId) => {
-        try {
-            await apiRequest(`/jobs/${jobId}/pause`, { method: 'POST' });
-        } catch (error) {
-            console.error('Failed to pause job:', error);
-            alert('Failed to pause job');
-        }
-    };
-
-    const handleResumeJob = async (jobId) => {
-        try {
-            await apiRequest(`/jobs/${jobId}/resume`, { method: 'POST' });
-        } catch (error) {
-            console.error('Failed to resume job:', error);
-            alert('Failed to resume job');
-        }
-    };
-
-    const handleCancelJob = async (jobId) => {
-        if (!confirm('Are you sure you want to cancel this job?')) return;
-        try {
-            await apiRequest(`/jobs/${jobId}/cancel`, { method: 'POST' });
-        } catch (error) {
-            console.error('Failed to cancel job:', error);
-            alert('Failed to cancel job');
-        }
-    };
-
-    const handlePauseAll = async () => {
-        if (!confirm('Pause all running jobs?')) return;
-        try {
-            const result = await apiRequest('/jobs/pause_all', { method: 'POST' });
-            console.log(`Paused ${result.paused_count} job(s)`);
-        } catch (error) {
-            console.error('Failed to pause all jobs:', error);
-            alert('Failed to pause all jobs');
-        }
-    };
-
-    const handleCreateJob = (result) => {
-        console.log('Job created:', result);
-        // Data will be updated via WebSocket
-    };
+    }
 
     const handleEditJob = (job) => {
         setSelectedJob(job);
         setShowEditModal(true);
     };
 
-    const handleUpdateJob = (result) => {
-        console.log('Job updated:', result);
-        // Data will be updated via WebSocket
-        setShowEditModal(false);
-    };
-
     const handleDownloadBlend = async (jobId) => {
+        setActionError(null);
         try {
-            const response = await fetch(`${API_BASE}/jobs/${jobId}/blend`);
-            if (!response.ok) {
-                throw new Error('Failed to download blend file');
-            }
+            const response = await apiFetch(apiKey, `/jobs/${jobId}/blend`);
             // Get filename from Content-Disposition header
             const contentDisposition = response.headers.get('Content-Disposition');
             let filename = `job_${jobId}.blend`;
@@ -894,20 +790,13 @@ function App() {
             window.URL.revokeObjectURL(url);
             document.body.removeChild(a);
         } catch (error) {
-            console.error('Failed to download blend file:', error);
-            alert('Failed to download blend file');
+            setActionError(`Failed to download blend file: ${error.message}`);
         }
     };
 
     const handleReloadBlend = (job) => {
         setSelectedJob(job);
         setShowReloadModal(true);
-    };
-
-    const handleReloadBlendSubmit = (result) => {
-        console.log('Blend file reloaded:', result);
-        // Data will be updated via WebSocket
-        setShowReloadModal(false);
     };
 
     // Calculate stats
@@ -925,13 +814,37 @@ function App() {
                         <i className="bi bi-film me-2"></i>WeRender
                     </a>
                     <div className="ms-auto">
-                        <ConnectionStatus connected={wsConnected} />
+                        <ConnectionStatus connected={connected} />
                     </div>
                 </div>
             </nav>
 
             {/* Main Content */}
             <div className="container-fluid py-4">
+                <form className="mb-4" onSubmit={event => {
+                    event.preventDefault();
+                    const field = event.currentTarget.elements.namedItem('api-key');
+                    connect(field.value.trim());
+                    field.value = '';
+                }}>
+                    <label className="form-label fw-semibold" htmlFor="api-key">Coordinator API key</label>
+                    <div className="d-flex flex-wrap align-items-start gap-2">
+                        <input id="api-key" name="api-key" type="password" autoComplete="off"
+                            className="form-control w-auto" aria-describedby="key-help" />
+                        <button className="btn btn-primary" type="submit">Connect</button>
+                        {apiKey && (
+                            <button className="btn btn-outline-light" type="button" onClick={() => connect('')}>
+                                Forget key
+                            </button>
+                        )}
+                    </div>
+                    <div id="key-help" className="form-text text-light">
+                        {apiKey ? 'Key is kept only until you reload or close this page.'
+                            : 'Leave blank if your proxy supplies the key. Use HTTPS or a trusted private network.'}
+                    </div>
+                </form>
+                {pollError && <div className="alert alert-warning" role="status">{pollError}</div>}
+                {actionError && <div className="alert alert-danger" role="alert">{actionError}</div>}
                 {loading ? (
                     <div className="text-center py-5">
                         <div className="spinner-border text-primary" role="status">
@@ -939,7 +852,7 @@ function App() {
                         </div>
                         <p className="mt-3 text-muted">Loading dashboard...</p>
                     </div>
-                ) : (
+                ) : connected && (
                     <>
                         {/* Stats Row */}
                         <div className="row g-3 mb-4">
@@ -990,7 +903,7 @@ function App() {
                                             {runningJobs > 0 && (
                                                 <button
                                                     className="btn btn-warning btn-sm"
-                                                    onClick={handlePauseAll}
+                                                    onClick={() => controlJob('/jobs/pause_all', 'pause all jobs', 'Pause all running jobs?')}
                                                     title="Pause all running jobs"
                                                 >
                                                     <i className="bi bi-pause-fill me-1"></i>Pause All
@@ -1021,10 +934,10 @@ function App() {
                                                 <JobCard
                                                     key={job.id}
                                                     job={job}
-                                                    onStart={handleStartJob}
-                                                    onPause={handlePauseJob}
-                                                    onResume={handleResumeJob}
-                                                    onCancel={handleCancelJob}
+                                                    onStart={id => controlJob(`/jobs/${id}/start`, 'start job')}
+                                                    onPause={id => controlJob(`/jobs/${id}/pause`, 'pause job')}
+                                                    onResume={id => controlJob(`/jobs/${id}/resume`, 'resume job')}
+                                                    onCancel={id => controlJob(`/jobs/${id}/cancel`, 'cancel job', 'Cancel this job?')}
                                                     onEdit={handleEditJob}
                                                     onDownloadBlend={handleDownloadBlend}
                                                     onReloadBlend={handleReloadBlend}
@@ -1061,18 +974,19 @@ function App() {
                                 </div>
 
                                 {/* Add-ons Card */}
-                                <AddonList addons={addons} />
+                                {addonsError ? <p role="status">{addonsError}</p> : <AddonList addons={addons} />}
                             </div>
                         </div>
                     </>
                 )}
             </div>
 
+            {connected && <>
             {/* Create Job Modal */}
             <CreateJobModal
                 show={showCreateModal}
                 onHide={() => setShowCreateModal(false)}
-                onCreate={handleCreateJob}
+                apiKey={apiKey}
             />
 
             {/* Edit Job Modal */}
@@ -1080,7 +994,7 @@ function App() {
                 show={showEditModal}
                 onHide={() => setShowEditModal(false)}
                 job={selectedJob}
-                onUpdate={handleUpdateJob}
+                apiKey={apiKey}
             />
 
             {/* Reload Blend Modal */}
@@ -1088,13 +1002,14 @@ function App() {
                 show={showReloadModal}
                 onHide={() => setShowReloadModal(false)}
                 job={selectedJob}
-                onReload={handleReloadBlendSubmit}
+                apiKey={apiKey}
             />
 
             {/* Backdrop */}
             {(showCreateModal || showEditModal || showReloadModal) && (
                 <div className="modal-backdrop fade show" style={{ zIndex: 1040 }}></div>
             )}
+            </>}
         </>
     );
 }

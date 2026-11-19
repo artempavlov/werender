@@ -1,5 +1,6 @@
 """Blender CLI wrapper for WeRender."""
 
+import os
 import re
 import shutil
 import subprocess
@@ -7,6 +8,50 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+
+RENDER_FORMATS = {
+    "PNG": ".png",
+    "JPEG": ".jpg",
+    "OPEN_EXR": ".exr",
+    "OPEN_EXR_MULTILAYER": ".exr",
+    "TIFF": ".tif",
+    "BMP": ".bmp",
+    "TARGA": ".tga",
+    "TARGA_RAW": ".tga",
+}
+
+
+def normalize_output_format(output_format: str) -> str:
+    output_format = output_format.upper()
+    if output_format == "EXR":
+        output_format = "OPEN_EXR"
+    if output_format not in RENDER_FORMATS:
+        raise ValueError(f"Unsupported render output format: {output_format}")
+    return output_format
+
+
+def _render_settings_expression(settings: dict) -> str:
+    lines = ["import bpy", "scene = bpy.context.scene", "scene.render.use_file_extension = True"]
+    for name, value in settings.items():
+        if name not in {"resolution_percentage", "samples"}:
+            raise ValueError(f"Unsupported render setting: {name}")
+        limit = 100 if name == "resolution_percentage" else 4096
+        if type(value) is not int or not 1 <= value <= limit:
+            raise ValueError(f"{name} must be an integer from 1 to {limit}")
+        if name == "resolution_percentage":
+            lines.append(f"scene.render.resolution_percentage = {value:d}")
+        else:
+            lines.extend([
+                "if scene.render.engine == 'CYCLES':",
+                f"    scene.cycles.samples = {value:d}",
+                "elif scene.render.engine in {'BLENDER_EEVEE', 'BLENDER_EEVEE_NEXT'}:",
+                "    if hasattr(scene.eevee, 'taa_render_samples'):",
+                f"        scene.eevee.taa_render_samples = {value:d}",
+                "    else:",
+                f"        scene.eevee.taa_samples = {value:d}",
+            ])
+    return "\n".join(lines)
 
 
 @dataclass
@@ -137,6 +182,7 @@ class BlenderRenderer:
         frame: int,
         output_dir: Path,
         output_format: str = "PNG",
+        render_settings: Optional[dict] = None,
     ) -> RenderResult:
         """
         Render a single frame from a .blend file.
@@ -156,62 +202,38 @@ class BlenderRenderer:
         output_dir = Path(output_dir).resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Blender outputs files with frame numbers padded to 4 digits
-        # e.g., "0001.png" for frame 1
-        output_pattern = output_dir / "####"
-
-        # Build the Blender command
-        cmd = [
-            self.blender_path,
-            "-b",  # Background mode (no GUI)
-            str(blend_file),
-            "-o",
-            str(output_pattern),
-            "-F",
-            output_format.upper(),
-            "-f",
-            str(frame),
-        ]
-
         start_time = time.time()
 
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=3600,  # 1 hour timeout per frame
-            )
+            output_format = normalize_output_format(output_format)
+            expected_output = output_dir / f"{frame:04d}{RENDER_FORMATS[output_format]}"
+            with tempfile.TemporaryDirectory(prefix=".render-", dir=output_dir) as directory:
+                staging = Path(directory)
+                cmd = [self.blender_path, "-b", "--disable-autoexec", str(blend_file),
+                       "--python-exit-code", "1"]
+                if gpu_setup := os.getenv("WERENDER_GPU_SETUP") or os.getenv("WERENDER_CUDA_SETUP"):
+                    cmd.extend(["--python", gpu_setup])
+                cmd.extend([
+                    "--python-expr", _render_settings_expression(render_settings or {}),
+                    "-o", str(staging / "####"), "-F", output_format, "-f", str(frame),
+                ])
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+                render_time = time.time() - start_time
+                for line in result.stdout.splitlines():
+                    if line.startswith(("WERENDER_CUDA:", "WERENDER_HIP:")):
+                        print(line, flush=True)
 
-            render_time = time.time() - start_time
-
-            # Find the output file
-            ext = self._format_to_extension(output_format)
-            expected_output = output_dir / f"{frame:04d}{ext}"
-
-            if expected_output.exists():
-                return RenderResult(
-                    success=True,
-                    frame=frame,
-                    output_file=expected_output,
-                    render_time=render_time,
-                )
-
-            # Check for errors in output
-            if result.returncode != 0:
-                return RenderResult(
-                    success=False,
-                    frame=frame,
-                    render_time=render_time,
-                    error_message=f"Blender exited with code {result.returncode}: {result.stderr}",
-                )
-
-            return RenderResult(
-                success=False,
-                frame=frame,
-                render_time=render_time,
-                error_message=f"Output file not found at {expected_output}",
-            )
+                if result.returncode != 0:
+                    return RenderResult(False, frame, render_time=render_time, error_message=(
+                        f"Blender exited with code {result.returncode}: "
+                        f"{result.stderr[-2000:] or result.stdout[-2000:]}"
+                    ))
+                staged_file = staging / expected_output.name
+                if not staged_file.is_file() or not staged_file.stat().st_size:
+                    return RenderResult(False, frame, render_time=render_time,
+                                        error_message=f"Blender did not produce {expected_output.name}")
+                staged_file.replace(expected_output)
+                return RenderResult(True, frame, expected_output, render_time)
 
         except subprocess.TimeoutExpired:
             return RenderResult(
@@ -248,72 +270,40 @@ class BlenderRenderer:
         blend_file = Path(blend_file).resolve()
 
         if output_path is None:
-            # Create packed file in temp directory
-            temp_dir = Path(tempfile.gettempdir()) / "werender"
-            temp_dir.mkdir(exist_ok=True)
-            output_path = temp_dir / f"{blend_file.stem}_packed.blend"
+            with tempfile.NamedTemporaryFile(prefix="werender-packed-", suffix=".blend", delete=False) as placeholder:
+                output_path = Path(placeholder.name)
+            output_path.unlink()
+        output_path = Path(output_path).resolve()
 
         # Python script to run inside Blender
         pack_script = """
 import bpy
 import sys
 
-try:
-    # Pack all external data
-    bpy.ops.file.pack_all()
-    
-    # Save to the output path (passed as last argument)
-    output_path = sys.argv[-1]
-    bpy.ops.wm.save_as_mainfile(filepath=output_path)
-    
-    print("PACK_SUCCESS")
-except Exception as e:
-    print(f"PACK_ERROR: {e}")
-    sys.exit(1)
+if 'FINISHED' not in bpy.ops.file.pack_all():
+    raise RuntimeError("Blender could not pack resources")
+if 'FINISHED' not in bpy.ops.wm.save_as_mainfile(filepath=sys.argv[-1], relative_remap=False):
+    raise RuntimeError("Blender could not save packed project")
 """
 
-        # Write temp script
-        script_path = Path(tempfile.gettempdir()) / "werender_pack.py"
-        script_path.write_text(pack_script)
-
         try:
-            result = subprocess.run(
-                [
-                    self.blender_path,
-                    "-b",
-                    str(blend_file),
-                    "--python",
-                    str(script_path),
-                    "--",
-                    str(output_path),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=300,  # 5 minute timeout for packing
-            )
-
-            if "PACK_SUCCESS" in result.stdout and output_path.exists():
-                return output_path
-
-            raise RuntimeError(f"Failed to pack resources: {result.stderr}")
+            with tempfile.TemporaryDirectory(prefix=".pack-", dir=output_path.parent) as directory:
+                script_path = Path(directory) / "pack.py"
+                script_path.write_text(pack_script, encoding="utf-8")
+                staging = Path(directory) / "packed.blend"
+                result = subprocess.run(
+                    [self.blender_path, "-b", "--disable-autoexec", str(blend_file),
+                     "--python-exit-code", "1", "--python", str(script_path), "--", str(staging)],
+                    capture_output=True, text=True, timeout=300,
+                )
+                if result.returncode == 0 and staging.is_file() and staging.stat().st_size:
+                    staging.replace(output_path)
+                    return output_path
+                raise RuntimeError(f"Failed to pack resources: {result.stderr or result.stdout}")
 
         except subprocess.TimeoutExpired:
             raise RuntimeError("Packing resources timed out after 5 minutes")
-        finally:
-            # Clean up temp script
-            if script_path.exists():
-                script_path.unlink()
 
     def _format_to_extension(self, output_format: str) -> str:
         """Convert Blender format name to file extension."""
-        format_map = {
-            "PNG": ".png",
-            "JPEG": ".jpg",
-            "OPEN_EXR": ".exr",
-            "OPEN_EXR_MULTILAYER": ".exr",
-            "TIFF": ".tif",
-            "BMP": ".bmp",
-            "TARGA": ".tga",
-            "TARGA_RAW": ".tga",
-        }
-        return format_map.get(output_format.upper(), ".png")
+        return RENDER_FORMATS[normalize_output_format(output_format)]

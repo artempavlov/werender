@@ -87,21 +87,24 @@ python -m pip install --upgrade build twine
 ### 5. Build the Package
 
 ```bash
-python -m build
+python -m build --outdir .tmp/release
 ```
 
 This creates:
-- `dist/werender-<version>.tar.gz` - Source distribution
-- `dist/werender-<version>-py3-none-any.whl` - Wheel distribution
+- `.tmp/release/werender-<version>.tar.gz` - Source distribution
+- `.tmp/release/werender-<version>-py3-none-any.whl` - Wheel distribution
+
+Start with an empty output directory. Do not commit generated distributions. The
+[checks workflow](../.github/workflows/ci.yml) builds, validates and installs the wheel without publishing it.
 
 ### 6. Verify the Package
 
 ```bash
 # Check package metadata
-python -m twine check dist/*
+python -m twine check --strict .tmp/release/*
 
 # List wheel contents
-python -m zipfile -l dist/werender-<version>-py3-none-any.whl
+python -m zipfile -l .tmp/release/werender-<version>-py3-none-any.whl
 ```
 
 Ensure all expected files are included and no sensitive files are present.
@@ -128,8 +131,8 @@ gh release edit v<version> --notes-file RELEASE_NOTES.md
 
 ```bash
 gh release upload v<version> \
-  dist/werender-<version>-py3-none-any.whl \
-  dist/werender-<version>.tar.gz
+  .tmp/release/werender-<version>-py3-none-any.whl \
+  .tmp/release/werender-<version>.tar.gz
 ```
 
 ### 9. Review and Publish
@@ -147,10 +150,10 @@ If you want to publish to PyPI:
 
 ```bash
 # Test upload to TestPyPI first
-python -m twine upload --repository testpypi dist/*
+python -m twine upload --repository testpypi .tmp/release/*
 
 # If successful, upload to PyPI
-python -m twine upload dist/*
+python -m twine upload .tmp/release/*
 ```
 
 Note: PyPI publishing requires:
@@ -240,7 +243,7 @@ jobs:
 ### Package Missing Files
 
 - Check `tool.hatch.build.targets.wheel` in `pyproject.toml`
-- Ensure all necessary files are included in `packages` or `artifacts`
+- Check Hatchling's `packages`, `include`, and `exclude` settings in `pyproject.toml`
 - Use `python -m zipfile -l` to inspect the wheel
 
 ### GitHub Release Issues
@@ -266,10 +269,10 @@ jobs:
 
 ```bash
 # Quick release sequence
-python -m build
-python -m twine check dist/*
+python -m build --outdir .tmp/release
+python -m twine check --strict .tmp/release/*
 gh release create v<version> --notes-file RELEASE_NOTES.md --draft
-gh release upload v<version> dist/*
+gh release upload v<version> .tmp/release/*
 # Review and publish on GitHub UI
 git tag -a v<version> -m "Release v<version>"
 git push origin v<version>

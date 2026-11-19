@@ -3,21 +3,28 @@
 import asyncio
 from contextlib import asynccontextmanager
 import hashlib
+import json
+import math
 import shutil
-import tempfile
+import sqlite3
+import struct
 import time
+import zlib
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from uuid import uuid4
 
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect, Depends, Query
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Depends, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from werender.core.blender import BlenderRenderer
-from werender.core.job import RenderJob, TaskStatus, JobStatus
+from werender.core.job import (
+    MAX_FRAME_ATTEMPTS, FrameTask, JobStatus, RenderJob, TaskStatus, validate_frame_range,
+)
 from werender.network.discovery import DiscoveryService, NodeInfo
 from werender.network.sync import SyncManager
 from werender.network.auth import AuthManager, get_api_key_dependency
@@ -25,7 +32,11 @@ from werender.network.security import BlendFileValidator, RateLimiter
 from werender.scheduler import TaskScheduler, SchedulingStrategy, ChunkingStrategy, JobRequirements
 from werender.core.job_templates import JobTemplateManager, JobExporter, JobPreset
 from werender.core.resource_manager import ResourceManager
-from werender.core.database import Database, JobStatus as DBJobStatus, TaskStatus as DBTaskStatus
+from werender.core.database import Database
+
+ACTIVE_TASKS = {TaskStatus.ASSIGNED, TaskStatus.RENDERING}
+TERMINAL_JOBS = {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}
+WORKER_TIMEOUT = 30
 
 
 
@@ -38,6 +49,9 @@ class WorkerInfo(BaseModel):
     gpu_name: str
     last_seen: float
     current_task_id: Optional[str] = None
+    blender_version: str = ""
+    ram_gb: Optional[float] = None
+    tags: set[str] = set()
 
 
 class UpdateJobRequest(BaseModel):
@@ -78,8 +92,9 @@ class CoordinatorServer:
         self.workers: dict[str, WorkerInfo] = {}
         self.blender_path: Optional[Path] = None
 
-        # WebSocket connections
-        self.websocket_connections: list[WebSocket] = []
+        self._background_tasks: list[asyncio.Task] = []
+        self._preparing_jobs: set[str] = set()
+        self._pack_lock = asyncio.Lock()
 
         # Discovery service
         self.discovery = DiscoveryService(
@@ -95,7 +110,7 @@ class CoordinatorServer:
 
         # Sync Manager with asset cache
         self.config_dir = Path.home() / ".werender"
-        self.config_dir.mkdir(exist_ok=True)
+        self.config_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.sync_manager = SyncManager(
             config_path=self.config_dir / "werender.json",
             addons_dir=self.config_dir / "addons",
@@ -147,13 +162,16 @@ class CoordinatorServer:
 
         # Create authentication dependencies
         worker_auth = get_api_key_dependency(self.auth_manager, "worker")
+        download_auth = get_api_key_dependency(self.auth_manager, ("worker", "coordinator"))
         coordinator_auth = get_api_key_dependency(self.auth_manager, "coordinator")
 
         # Worker endpoints (require worker authentication)
         self.app.get("/api/tasks/request", dependencies=[Depends(worker_auth)])(self._api_request_task)
         self.app.post("/api/tasks/{task_id}/complete", dependencies=[Depends(worker_auth)])(self._api_complete_task)
         self.app.post("/api/tasks/{task_id}/fail", dependencies=[Depends(worker_auth)])(self._api_fail_task)
-        self.app.get("/api/jobs/{job_id}/blend", dependencies=[Depends(worker_auth)])(self._api_get_blend_file)
+        self.app.post("/api/heartbeat", dependencies=[Depends(worker_auth)])(self._api_heartbeat)
+        self.app.get("/api/jobs/{job_id}/blend", dependencies=[Depends(download_auth)])(self._api_get_blend_file)
+        self.app.head("/api/jobs/{job_id}/blend", dependencies=[Depends(download_auth)])(self._api_get_blend_file)
 
         # Job management endpoints (require coordinator authentication - CRITICAL SECURITY FIX)
         self.app.post("/api/jobs/create", dependencies=[Depends(coordinator_auth)])(self._api_create_job)
@@ -192,11 +210,8 @@ class CoordinatorServer:
         # Sync endpoints (require coordinator authentication - SECURITY FIX)
         self.app.get("/api/sync/manifest", dependencies=[Depends(worker_auth)])(self._api_get_sync_manifest)
         self.app.get("/api/sync/settings", dependencies=[Depends(worker_auth)])(self._api_get_settings)
-        self.app.get("/api/sync/addons", dependencies=[Depends(worker_auth)])(self._api_list_addons)
-        self.app.get("/api/sync/addons/{addon_name}/download", dependencies=[Depends(worker_auth)])(self._api_download_addon)
-
-        # WebSocket endpoint
-        self.app.websocket("/ws")(self._websocket_endpoint)
+        self.app.get("/api/sync/addons", dependencies=[Depends(download_auth)])(self._api_list_addons)
+        self.app.get("/api/sync/addons/{addon_name}/download", dependencies=[Depends(download_auth)])(self._api_download_addon)
 
         # Serve static files (dashboard)
         dashboard_dir = Path(__file__).parent.parent / "dashboard"
@@ -206,158 +221,115 @@ class CoordinatorServer:
     async def _on_startup(self) -> None:
         """Handle startup event - initialize services and background tasks."""
         # Start mDNS discovery to find workers on the network
-        self.discovery.start()
-        self.discovery.on_discovery = self._on_worker_discovered
-        self.discovery.on_removal = self._on_worker_removed
-
-        # Launch background tasks for monitoring and updates
-        # Health check: monitors worker connectivity and re-queues tasks from dead workers
-        # Broadcast: sends periodic updates to dashboard clients
-        asyncio.create_task(self._health_check_loop())
-        asyncio.create_task(self._broadcast_updates_loop())
+        if not getattr(self, "direct_only", False):
+            self.discovery.on_discovery = self._on_worker_discovered
+            self.discovery.on_removal = self._on_worker_removed
+            self.discovery.start()
+        self._background_tasks = [asyncio.create_task(self._health_check_loop())]
 
     async def _on_shutdown(self) -> None:
         """Handle shutdown event."""
-        # Save current state to database
-        self._save_persisted_data()
-        self.discovery.stop()
+        for task in self._background_tasks:
+            task.cancel()
+        await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        if not getattr(self, "direct_only", False):
+            self.discovery.stop()
 
     def _load_persisted_data(self) -> None:
-        """Load persisted jobs and workers from database."""
-        try:
-            # Load workers
-            workers = self.database.list_workers(online_only=False)
-            for worker_data in workers:
-                worker_info = WorkerInfo(
-                    worker_id=worker_data["id"],
-                    worker_name=worker_data["name"],
-                    cpu_cores=worker_data.get("cpu_cores", 0),
-                    gpu_name=worker_data.get("gpu_name", "None"),
-                    last_seen=time.time(),
+        """Restore existing schema rows, reconstructing frames omitted by older releases."""
+        self.database.mark_workers_offline()
+        for row in self.database.list_jobs():
+            metadata = row.get("metadata") or {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            options = {k: metadata[k] for k in (
+                "requires_gpu", "min_memory_gb", "worker_tags", "depends_on", "scheduled_time",
+            ) if k in metadata}
+            try:
+                job = RenderJob(
+                    **options, id=row["id"], name=row["name"],
+                    blend_file=row["blend_file_path"] or row["packed_file_path"] or Path("missing.blend"),
+                    packed_file=row["packed_file_path"], blend_file_hash=row["blend_file_hash"],
+                    frame_start=row["frame_start"], frame_end=row["frame_end"],
+                    status=row["status"], priority=row["priority"] or 5,
+                    created_at=row["created_at"], started_at=row["started_at"],
+                    completed_at=row["completed_at"], blender_version=row["blender_version"] or "",
+                    output_directory=row["output_dir"] or self._legacy_output_directory(row["id"]),
+                    database_metadata=metadata,
                 )
-                self.workers[worker_data["id"]] = worker_info
-                # Update online status
-                self.database.update_worker_online_status(worker_data["id"], False)
+                by_frame = {}
+                for data in self.database.get_job_tasks(job.id):
+                    task = FrameTask(**data, output_file=data["output_file_path"])
+                    if task.status in ACTIVE_TASKS:
+                        task.reset()
+                    elif task.status == TaskStatus.COMPLETED and task.output_file is None:
+                        candidate = job.output_directory / f"{task.frame_number:04d}.png"
+                        if candidate.is_file():
+                            task.output_file = candidate
+                    by_frame[task.frame_number] = task
+                job.tasks = [by_frame.get(frame) or FrameTask(frame_number=frame)
+                             for frame in range(job.frame_start, job.frame_end + 1)]
+                if job.status == JobStatus.RUNNING:
+                    job.check_completion()
+                # Existing completed results retain their original paths. Future frames
+                # for active legacy jobs no longer write into the old shared directory.
+                if job.status not in TERMINAL_JOBS and not metadata.get("managed_output"):
+                    job.output_directory = self._job_dir(job.id) / "frames"
+                if job.status not in TERMINAL_JOBS and job.packed_file and not job.packed_file.is_file():
+                    job.blend_file_hash = None
+                if job.status not in TERMINAL_JOBS or row["status"] != job.status:
+                    self._save_job_to_db(job, replace_tasks=True)
+                self.jobs[job.id] = job
+            except (ValidationError, ValueError, TypeError) as exc:
+                print(f"⚠️  Failed to load job {row['id']}: {exc}")
 
-            # Load recent jobs (last 100)
-            jobs = self.database.list_jobs(limit=100)
-            for job_data in jobs:
-                # Only load completed/failed jobs for history
-                # Active jobs should be recreated from current state
-                if job_data["status"] in (DBJobStatus.COMPLETED, DBJobStatus.FAILED, DBJobStatus.CANCELLED):
-                    # Create job object from database data
-                    try:
-                        job = RenderJob(
-                            id=job_data["id"],
-                            name=job_data["name"],
-                            blend_file=Path(job_data["blend_file_path"]) if job_data.get("blend_file_path") else None,
-                            frame_start=job_data["frame_start"],
-                            frame_end=job_data["frame_end"],
-                        )
-                        job.status = JobStatus(job_data["status"])
-                        job.created_at = datetime.fromisoformat(job_data["created_at"]) if job_data.get("created_at") else datetime.now()
-                        if job_data.get("output_dir"):
-                            job.output_directory = Path(job_data["output_dir"])
-                        
-                        # Load tasks
-                        tasks = self.database.get_job_tasks(job_data["id"])
-                        for task_data in tasks:
-                            from werender.core.job import FrameTask
-                            task = FrameTask(
-                                id=task_data["id"],
-                                frame_number=task_data["frame_number"],
-                                assigned_worker=task_data.get("assigned_worker"),
-                            )
-                            task.status = TaskStatus(task_data["status"])
-                            if task_data.get("output_file_path"):
-                                task.output_file = Path(task_data["output_file_path"])
-                            if task_data.get("render_time_seconds"):
-                                task.render_time_seconds = task_data["render_time_seconds"]
-                            job.tasks.append(task)
-                        
-                        self.jobs[job.id] = job
-                    except Exception as e:
-                        print(f"⚠️  Failed to load job {job_data['id']}: {e}")
+    def _job_dir(self, job_id: str) -> Path:
+        return self.config_dir / "jobs" / job_id
 
-        except Exception as e:
-            print(f"⚠️  Error loading persisted data: {e}")
+    @staticmethod
+    def _legacy_output_directory(job_id: str) -> Path:
+        directory = Path("output") / job_id
+        return directory if directory.is_dir() else Path("output")
 
-    def _save_persisted_data(self) -> None:
-        """Save current jobs and workers to database."""
-        try:
-            # Save all workers
-            for worker_id, worker_info in self.workers.items():
-                worker_data = {
-                    "id": worker_id,
-                    "name": worker_info.worker_name,
-                    "cpu_cores": worker_info.cpu_cores,
-                    "gpu_name": worker_info.gpu_name,
-                    "is_online": True,
-                    "last_seen": datetime.now(),
-                    "current_task_id": worker_info.current_task_id,
-                }
-                self.database.save_worker(worker_data)
+    def _save_job_to_db(self, job: RenderJob, tasks=(), *, replace_tasks=False) -> None:
+        data = job.model_dump(mode="json", exclude={"tasks"})
+        metadata = job.database_metadata | {k: data[k] for k in (
+            "requires_gpu", "min_memory_gb", "worker_tags", "depends_on", "scheduled_time",
+        )}
+        metadata["managed_output"] = job.output_directory.is_relative_to(self._job_dir(job.id))
+        data.update(blend_file_path=data["blend_file"], packed_file_path=data["packed_file"],
+                    output_dir=data["output_directory"], metadata=metadata)
+        if replace_tasks:
+            tasks = job.tasks
+        self.database.save_job_state(data, (
+            dict(t.model_dump(mode="json"), job_id=job.id,
+                 output_file_path=str(t.output_file) if t.output_file else None)
+            for t in tasks
+        ), replace_tasks=replace_tasks)
 
-            # Save all jobs
-            for job_id, job in self.jobs.items():
-                job_data = {
-                    "id": job.id,
-                    "name": job.name,
-                    "blend_file_path": str(job.blend_file) if job.blend_file else None,
-                    "packed_file_path": str(job.packed_file) if job.packed_file else None,
-                    "frame_start": job.frame_start,
-                    "frame_end": job.frame_end,
-                    "status": job.status.value,
-                    "priority": getattr(job, "priority", 0),
-                    "created_at": job.created_at.isoformat() if job.created_at else datetime.now().isoformat(),
-                    "started_at": job.started_at.isoformat() if job.started_at else None,
-                    "completed_at": job.completed_at.isoformat() if job.completed_at else None,
-                    "blender_version": job.blender_version,
-                    "output_dir": str(job.output_directory),
-                }
-                self.database.save_job(job_data)
+    def _change_job(self, job: RenderJob, *, tasks=None, replace_tasks=False, **changes) -> None:
+        """Persist a staged state before exposing it to request handlers."""
+        updated = job.model_copy(update=changes)
+        if replace_tasks:
+            updated.tasks = tasks
+        self._save_job_to_db(updated, tasks or (), replace_tasks=replace_tasks)
+        for key, value in changes.items():
+            setattr(job, key, value)
+        if replace_tasks:
+            job.tasks = tasks
 
-                # Save all tasks
-                for task in job.tasks:
-                    task_data = {
-                        "id": task.id,
-                        "job_id": job.id,
-                        "frame_number": task.frame_number,
-                        "status": task.status.value,
-                        "assigned_worker": task.assigned_worker,
-                        "assigned_at": task.assigned_at.isoformat() if task.assigned_at else None,
-                        "started_at": task.started_at.isoformat() if task.started_at else None,
-                        "completed_at": task.completed_at.isoformat() if task.completed_at else None,
-                        "render_time_seconds": task.render_time_seconds,
-                        "output_file_path": str(task.output_file) if task.output_file else None,
-                        "error_message": task.error_message,
-                    }
-                    self.database.save_task(task_data)
-
-        except Exception as e:
-            print(f"⚠️  Error saving persisted data: {e}")
-
-    def _save_job_to_db(self, job: RenderJob) -> None:
-        """Save a single job to database."""
-        try:
-            job_data = {
-                "id": job.id,
-                "name": job.name,
-                "blend_file_path": str(job.blend_file) if job.blend_file else None,
-                "packed_file_path": str(job.packed_file) if job.packed_file else None,
-                "frame_start": job.frame_start,
-                "frame_end": job.frame_end,
-                "status": job.status.value,
-                "priority": getattr(job, "priority", 0),
-                "created_at": job.created_at.isoformat() if job.created_at else datetime.now().isoformat(),
-                "started_at": job.started_at.isoformat() if job.started_at else None,
-                "completed_at": job.completed_at.isoformat() if job.completed_at else None,
-                "blender_version": job.blender_version,
-                "output_dir": str(job.output_directory),
-            }
-            self.database.save_job(job_data)
-        except Exception as e:
-            print(f"⚠️  Error saving job to database: {e}")
+    def _commit_task(self, job: RenderJob, task: FrameTask, updated: FrameTask) -> None:
+        status = job.status
+        completed_at = job.completed_at
+        if updated.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+            other = [t.status for t in job.tasks if t is not task]
+            if all(s in (TaskStatus.COMPLETED, TaskStatus.FAILED) for s in other):
+                status = (JobStatus.FAILED if TaskStatus.FAILED in [updated.status, *other]
+                          else JobStatus.COMPLETED)
+                completed_at = datetime.now()
+        self._change_job(job, tasks=[updated], status=status, completed_at=completed_at)
+        for name in FrameTask.model_fields:
+            setattr(task, name, getattr(updated, name))
 
     def _save_worker_to_db(self, worker_info: WorkerInfo) -> None:
         """Save a single worker to database."""
@@ -367,8 +339,10 @@ class CoordinatorServer:
                 "name": worker_info.worker_name,
                 "cpu_cores": worker_info.cpu_cores,
                 "gpu_name": worker_info.gpu_name,
+                "blender_version": worker_info.blender_version,
+                "ram_gb": worker_info.ram_gb,
                 "is_online": True,
-                "last_seen": datetime.now(),
+                "last_seen": datetime.fromtimestamp(worker_info.last_seen),
                 "current_task_id": worker_info.current_task_id,
             }
             self.database.save_worker(worker_data)
@@ -387,40 +361,21 @@ class CoordinatorServer:
             await asyncio.sleep(5)
             current_time = time.time()
 
-            # Identify workers that haven't sent a heartbeat recently
-            stale_workers = []
-            for worker_id, worker_info in self.workers.items():
-                if current_time - worker_info.last_seen > 30:  # 30 second timeout
-                    stale_workers.append(worker_id)
+            for worker_id, worker in list(self.workers.items()):
+                if current_time - worker.last_seen > WORKER_TIMEOUT:
+                    try:
+                        self._expire_worker(worker_id)
+                    except (sqlite3.Error, OSError) as exc:
+                        print(f"⚠️  Could not expire worker {worker_id}: {exc}")
 
-            # Handle stale workers: re-queue their tasks and remove them
-            for worker_id in stale_workers:
-                worker = self.workers[worker_id]
-                
-                # If this worker had an active task, it needs to be re-queued
-                if worker.current_task_id:
-                    task_found = False
-                    for job in self.jobs.values():
-                        for task in job.tasks:
-                            if task.id == worker.current_task_id:
-                                print(f"⚠️  Worker {worker.worker_name} timed out, re-queueing task {task.id}")
-                                task.reset()
-                                task_found = True
-                                break
-                        if task_found:
-                            break
-
-                del self.workers[worker_id]
-                print(f"⚠️  Worker {worker.worker_name} removed (timeout)")
-
-            # Update dashboard with the new worker list
-            await self._broadcast_update("workers")
-
-    async def _broadcast_updates_loop(self) -> None:
-        """Periodically broadcast updates to WebSocket clients."""
-        while True:
-            await asyncio.sleep(2)
-            await self._broadcast_update("all")
+    def _expire_worker(self, worker_id: str) -> None:
+        worker = self.workers[worker_id]
+        if worker.current_task_id:
+            job, task = self._find_task(worker.current_task_id)
+            if task and task.status in ACTIVE_TASKS and task.assigned_worker == worker_id:
+                self._record_failure(job, task, "Worker disconnected or timed out")
+        del self.workers[worker_id]
+        self.database.update_worker_online_status(worker_id, False)
 
     async def _on_worker_discovered(self, node: NodeInfo) -> None:
         """
@@ -430,7 +385,6 @@ class CoordinatorServer:
         must make an authenticated API request before it can receive tasks.
         """
         print(f"✅ Worker discovered: {node.hostname} ({node.address}:{node.port})")
-        await self._broadcast_update("workers")
 
     async def _on_worker_removed(self, node: NodeInfo) -> None:
         """
@@ -439,35 +393,16 @@ class CoordinatorServer:
         This happens when a worker shuts down gracefully or disconnects from
         the network. Any task the worker was working on gets re-queued.
         """
-        # Find all workers matching this hostname (in case of duplicates)
-        to_remove = []
-        for worker_id, worker_info in self.workers.items():
-            if worker_info.worker_name == node.hostname:
-                to_remove.append(worker_id)
-
-        # Clean up each disconnected worker
-        for worker_id in to_remove:
-            worker = self.workers[worker_id]
-            
-            # Re-queue any task this worker was working on
-            if worker.current_task_id:
-                task_found = False
-                for job in self.jobs.values():
-                    for task in job.tasks:
-                        if task.id == worker.current_task_id:
-                            print(f"⚠️  Worker {worker.worker_name} disconnected, re-queueing task {task.id}")
-                            task.reset()
-                            task_found = True
-                            break
-                    if task_found:
-                        break
-
-            del self.workers[worker_id]
-            print(f"⚠️  Worker {worker.worker_name} removed (disconnected)")
-
-        await self._broadcast_update("workers")
+        # Discovery is advisory: hostname collisions or transient mDNS loss must
+        # not invalidate an authenticated worker's active lease.
+        print(f"Worker announcement removed: {node.hostname}")
 
     # ========== API Endpoints ==========
+
+    async def _api_heartbeat(self, worker_id: str) -> dict:
+        if worker := self.workers.get(worker_id):
+            worker.last_seen = time.time()
+        return {}
 
     async def _api_request_task(
         self,
@@ -475,6 +410,8 @@ class CoordinatorServer:
         worker_name: str,
         cpu_cores: int,
         gpu_name: str,
+        blender_version: str = "",
+        ram_gb: Optional[float] = None,
     ) -> dict:
         """
         Worker requests a new task to render.
@@ -486,6 +423,12 @@ class CoordinatorServer:
         Returns 204 (No Content) if no tasks are available.
         """
         current_time = time.time()
+        existing = self.workers.get(worker_id)
+        if existing and existing.current_task_id:
+            # A lost assignment reply must not let polling renew the orphaned lease.
+            if current_time - existing.last_seen <= WORKER_TIMEOUT:
+                raise HTTPException(status_code=204)
+            self._expire_worker(worker_id)
 
         # Register or update this worker's information
         # The worker_id should be unique per worker instance
@@ -498,6 +441,9 @@ class CoordinatorServer:
             gpu_name=gpu_name,
             last_seen=current_time,
             current_task_id=None,
+            blender_version=blender_version,
+            ram_gb=ram_gb,
+            tags=self.resource_manager.get_worker_limits(worker_id).tags,
         )
         self.workers[worker_id] = worker_info
         self._save_worker_to_db(worker_info)
@@ -514,6 +460,8 @@ class CoordinatorServer:
 
         # Look for the next pending task across all running jobs (prioritized)
         for job in sorted_jobs:
+            if job.id in self._preparing_jobs:
+                continue
             task = job.get_next_task()
             if not task:
                 continue
@@ -538,26 +486,58 @@ class CoordinatorServer:
                 worker_tags=job.worker_tags,
             )
 
-            # Use scheduler to select the best worker
+            # A recent eligible idle worker may receive preference; stale/pinned
+            # workers must never veto other peers. The pull request is the handoff.
+            eligible_workers = {
+                wid: worker for wid, worker in self.workers.items()
+                if current_time - worker.last_seen <= 5
+                and self.resource_manager.can_worker_accept_task(
+                    wid, worker, job, int(bool(worker.current_task_id))
+                )[0]
+            }
             selected_worker = self.scheduler.select_worker(
                 task=task,
                 job=job,
-                workers=self.workers,
+                workers=eligible_workers,
                 job_requirements=job_requirements,
             )
 
             if selected_worker == worker_id:
-                # This worker was selected! Assign the task
-                task.assign_to(worker_id)
-                task.start_rendering()
+                # Legacy jobs may not have a hash persisted yet. Prepare once,
+                # outside the event loop, and let the next poll claim the frame.
+                if not job.blend_file_hash:
+                    self._preparing_jobs.add(job.id)
+                    try:
+                        try:
+                            scene = await asyncio.to_thread(self._scene_file, job)
+                            if scene is None:
+                                continue
+                            digest = await asyncio.to_thread(self._hash_scene, scene)
+                        except OSError:
+                            continue
+                        self._change_job(job, blend_file_hash=digest,
+                                         packed_file=job.packed_file if scene == job.packed_file else None)
+                    finally:
+                        self._preparing_jobs.discard(job.id)
+                    if (job.status != JobStatus.RUNNING or worker_info.current_task_id
+                            or self.workers.get(worker_id) is not worker_info
+                            or task not in job.tasks or task.status != TaskStatus.PENDING):
+                        continue
+                updated = task.model_copy()
+                updated.assign_to(worker_id)
+                updated.start_rendering()
+                self._commit_task(job, task, updated)
                 self.workers[worker_id].current_task_id = task.id
+                self._save_worker_to_db(worker_info)
+                self.scheduler.record_assignment(worker_id)
 
                 # Return task details so the worker knows what to render
                 return {
                     "id": task.id,
                     "job_id": job.id,
                     "frame_number": task.frame_number,
-                    "blend_file_hash": self._get_blend_file_hash(job),
+                    "blend_file_hash": job.blend_file_hash,
+                    "blender_version": job.blender_version,
                     "assignment": task.assigned_at.isoformat(),
                 }
 
@@ -572,135 +552,86 @@ class CoordinatorServer:
         assignment: str = Form(""),
     ) -> dict:
         """API: Upload completed task result."""
-        # Find the task
-        task = None
-        job = None
-        for j in self.jobs.values():
-            for t in j.tasks:
-                if t.id == task_id:
-                    task = t
-                    job = j
-                    break
-            if task:
-                break
-
+        job, task = self._find_task(task_id)
         if not task or not job:
             raise HTTPException(status_code=404, detail="Task not found")
-        # The first request may already have committed, even if its reply was lost.
+        self._check_task_assignment(task, assignment, allow_completed=True)
         if task.status == TaskStatus.COMPLETED:
             return {"status": "success"}
-        self._check_task_assignment(task, assignment)
-
-        # Save output file
-        output_path = job.output_directory / f"{task.frame_number:04d}.png"
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        partial = output_path.with_suffix(".png.part")
         try:
-            with partial.open("wb") as f:
-                shutil.copyfileobj(output.file, f)
+            duration = float(render_time)
+            if not math.isfinite(duration) or duration < 0:
+                raise ValueError
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Invalid render time")
+
+        output_path = job.output_directory / f"{task.frame_number:04d}.png"
+        partial = output_path.with_suffix(f".{uuid4().hex}.part")
+        try:
+            try:
+                await asyncio.to_thread(self._stage_png, output.file, partial)
+            except (ValueError, zlib.error):
+                raise HTTPException(status_code=422, detail="Result is not a valid PNG")
+            self._check_task_assignment(task, assignment, allow_completed=True)
+            if task.status == TaskStatus.COMPLETED:
+                return {"status": "success"}
+            # Task may have been removed by an edit while the upload was copied.
+            if task not in job.tasks:
+                raise HTTPException(status_code=409, detail="Task was replaced")
             partial.replace(output_path)
+            updated = task.model_copy()
+            updated.complete(output_path)
+            updated.render_time_seconds = duration
+            updated.error_message = None
+            try:
+                self._commit_task(job, task, updated)
+            except Exception:
+                output_path.unlink(missing_ok=True)
+                raise
         finally:
             partial.unlink(missing_ok=True)
-
-        # Mark task as complete
-        task.complete(output_path)
-
-        # Save task to database
-        try:
-            task_data = {
-                "id": task.id,
-                "job_id": job.id,
-                "frame_number": task.frame_number,
-                "status": task.status.value,
-                "assigned_worker": task.assigned_worker,
-                "assigned_at": task.assigned_at.isoformat() if task.assigned_at else None,
-                "started_at": task.started_at.isoformat() if task.started_at else None,
-                "completed_at": task.completed_at.isoformat() if task.completed_at else None,
-                "render_time_seconds": task.render_time_seconds,
-                "output_file_path": str(task.output_file) if task.output_file else None,
-            }
-            self.database.save_task(task_data)
-        except Exception as e:
-            print(f"⚠️  Error saving task to database: {e}")
-
-        # Update scheduler statistics
-        if task.assigned_worker and task.render_time_seconds:
-            self.scheduler.update_worker_stats(
-                task.assigned_worker,
-                task.render_time_seconds,
-            )
-
-        # Free up worker
+        if task.assigned_worker:
+            self.scheduler.update_worker_stats(task.assigned_worker, duration)
         self._release_task_worker(task)
-
-        # Check if job is complete
-        job.check_completion()
-
-        if job.status == "completed":
-            print(f"🎉 Job {job.name} completed!")
-            # Update job status in database
-            self.database.update_job_status(
-                job.id,
-                DBJobStatus.COMPLETED,
-                completed_at=datetime.now(),
-            )
-
-        # Save job status update
-        self._save_job_to_db(job)
-
-        await self._broadcast_update("jobs")
         return {"status": "success"}
 
     async def _api_fail_task(self, task_id: str, error: dict) -> dict:
         """API: Report task failure."""
-        # Find the task
-        task = None
-        job = None
-        for j in self.jobs.values():
-            for t in j.tasks:
-                if t.id == task_id:
-                    task = t
-                    job = j
-                    break
-            if task:
-                break
-
+        job, task = self._find_task(task_id)
         if not task or not job:
             raise HTTPException(status_code=404, detail="Task not found")
-        if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+        assignment = error.get("assignment")
+        if (assignment and assignment == task.last_failed_assignment
+                and task.status in (TaskStatus.PENDING, TaskStatus.FAILED)):
             return {"status": "success"}
-        self._check_task_assignment(task, error.get("assignment"))
-
-        # Mark task as failed
-        task.fail(error.get("error", "Unknown error"))
-
-        # Save task failure to database
-        try:
-            task_data = {
-                "id": task.id,
-                "job_id": job.id,
-                "frame_number": task.frame_number,
-                "status": task.status.value,
-                "assigned_worker": task.assigned_worker,
-                "completed_at": task.completed_at.isoformat() if task.completed_at else None,
-                "error_message": task.error_message,
-            }
-            self.database.save_task(task_data)
-        except Exception as e:
-            print(f"⚠️  Error saving task failure to database: {e}")
-
-        # Free up worker
-        self._release_task_worker(task)
-
-        await self._broadcast_update("jobs")
+        self._check_task_assignment(task, assignment)
+        self._record_failure(job, task, str(error.get("error", "Unknown error"))[:4096])
         return {"status": "success"}
 
+    def _find_task(self, task_id):
+        for job in self.jobs.values():
+            for task in job.tasks:
+                if task.id == task_id:
+                    return job, task
+        return None, None
+
+    def _record_failure(self, job, task, message):
+        previous = task.model_copy()
+        updated = task.model_copy()
+        updated.failures += 1
+        updated.last_failed_assignment = task.assigned_at.isoformat() if task.assigned_at else None
+        if updated.failures >= MAX_FRAME_ATTEMPTS:
+            updated.fail(message)
+        else:
+            updated.reset()
+            updated.error_message = message
+        self._commit_task(job, task, updated)
+        self._release_task_worker(previous)
+
     @staticmethod
-    def _check_task_assignment(task, assignment: str | None) -> None:
-        if task.status not in (TaskStatus.ASSIGNED, TaskStatus.RENDERING) or (
-            assignment and (not task.assigned_at or task.assigned_at.isoformat() != assignment)
-        ):
+    def _check_task_assignment(task, assignment: str | None, *, allow_completed=False) -> None:
+        valid_status = task.status in ACTIVE_TASKS or (allow_completed and task.status == TaskStatus.COMPLETED)
+        if not valid_status or not task.assigned_at or task.assigned_at.isoformat() != assignment:
             raise HTTPException(status_code=409, detail="Task assignment is no longer active")
 
     def _release_task_worker(self, task) -> None:
@@ -716,8 +647,8 @@ class CoordinatorServer:
             raise HTTPException(status_code=404, detail="Job not found")
 
         # Use packed file if available, otherwise original
-        blend_file = job.packed_file or job.blend_file
-        if not blend_file.exists():
+        blend_file = await asyncio.to_thread(self._scene_file, job)
+        if blend_file is None:
             raise HTTPException(status_code=404, detail="Blend file not found")
 
         return FileResponse(
@@ -732,60 +663,72 @@ class CoordinatorServer:
         frame_start: int = Form(...),
         frame_end: int = Form(...),
         name: str = Form(""),
+        template_id: Optional[str] = Form(None),
     ) -> dict:
         """API: Create a new render job."""
-        # Sanitize filename to prevent path traversal
-        safe_filename = BlendFileValidator.sanitize_filename(file.filename or "unnamed.blend")
-        
-        # Save uploaded blend file
-        temp_dir = Path(tempfile.gettempdir()) / "werender" / "jobs"
-        temp_dir.mkdir(parents=True, exist_ok=True)
-
-        blend_path = temp_dir / safe_filename
-        with open(blend_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
-        
-        # Validate the .blend file for security
-        is_valid, error_msg = BlendFileValidator.validate_blend_file(blend_path)
-        if not is_valid:
-            blend_path.unlink()  # Delete the invalid file
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid .blend file: {error_msg}"
-            )
-
-        # Check if coordinator can accept new job
-        current_job_count = sum(1 for j in self.jobs.values() if j.status == "running")
-        can_accept, reason = self.resource_manager.can_coordinator_accept_job(current_job_count)
-        if not can_accept:
-            blend_path.unlink()  # Clean up
-            raise HTTPException(status_code=503, detail=f"Cannot accept job: {reason}")
-
-        # Create job
-        job = RenderJob(
-            name=name or file.filename,
-            blend_file=blend_path,
-            frame_start=frame_start,
-            frame_end=frame_end,
-        )
-        job.create_tasks()
-
-        # Pack resources
-        print(f"📦 Packing resources for job {job.id}...")
         try:
-            renderer = BlenderRenderer()
-            job.packed_file = renderer.pack_resources(blend_path)
-            job.blender_version = renderer.get_version()
-            print(f"✅ Resources packed for job {job.id}")
-        except Exception as e:
-            print(f"⚠️  Warning: Failed to pack resources: {e}")
-
-        self.jobs[job.id] = job
-        self._save_job_to_db(job)
-        print(f"✅ Job created: {job.name} (frames {frame_start}-{frame_end})")
-
-        await self._broadcast_update("jobs")
+            job = RenderJob(name=name or file.filename or "Unnamed job", blend_file=Path("scene.blend"),
+                            frame_start=frame_start, frame_end=frame_end)
+            if isinstance(template_id, str) and template_id:
+                template = self.template_manager.get_template(template_id)
+                if not template:
+                    raise HTTPException(status_code=404, detail="Template not found")
+                template.apply_to_job(job)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        await self._prepare_new_job(job, file)
         return {"job_id": job.id, "status": "pending"}
+
+    async def _prepare_new_job(self, job: RenderJob, upload: UploadFile) -> None:
+        can_accept, reason = await asyncio.to_thread(self.resource_manager.check_disk_space)
+        if not can_accept:
+            raise HTTPException(status_code=503, detail=f"Cannot accept job: {reason}")
+        scene_dir = self._job_dir(job.id) / uuid4().hex
+        job.blend_file, job.packed_file, version, job.blend_file_hash = await self._prepare_scene(upload, scene_dir)
+        job.blender_version = job.blender_version or version
+        job.output_directory = scene_dir / "frames"
+        job.create_tasks()
+        self._save_job_to_db(job, replace_tasks=True)
+        self.jobs[job.id] = job
+
+    async def _prepare_scene(self, upload: UploadFile, directory: Path, *, require_pack=False):
+        filename = upload.filename or "scene.blend"
+        if not filename.lower().endswith(".blend"):
+            raise HTTPException(status_code=400, detail="File must be a .blend file")
+        source = directory / "source.blend"
+        packed = directory / "packed.blend"
+
+        def prepare():
+            directory.mkdir(parents=True, exist_ok=False, mode=0o700)
+            try:
+                with source.open("xb") as target:
+                    self._copy_bounded(upload.file, target, BlendFileValidator.MAX_FILE_SIZE)
+                valid, reason = BlendFileValidator.validate_blend_file(source)
+                if not valid:
+                    raise ValueError(f"Invalid .blend file: {reason}")
+                version = ""
+                result = None
+                try:
+                    renderer = BlenderRenderer()
+                    candidate = renderer.pack_resources(source, output_path=packed)
+                    if candidate != packed or not packed.is_file():
+                        raise RuntimeError("Blender did not create a packed scene")
+                    result = packed
+                    version = renderer.get_version()
+                except Exception as exc:
+                    if require_pack and result is None:
+                        raise HTTPException(status_code=500, detail="Could not pack replacement scene") from exc
+                    print(f"⚠️  Scene packing/version detection unavailable: {exc}")
+                return source, result, version, self._hash_scene(result or source)
+            except Exception:
+                shutil.rmtree(directory)
+                raise
+
+        async with self._pack_lock:
+            try:
+                return await asyncio.to_thread(prepare)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     async def _api_list_jobs(self) -> list[dict]:
         """API: List all jobs."""
@@ -805,7 +748,6 @@ class CoordinatorServer:
 
     async def _api_get_job(self, job_id: str) -> dict:
         """API: Get job details."""
-        print(f"[DEBUG] _api_get_job called with job_id={job_id}")
         job = self.jobs.get(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
@@ -819,16 +761,20 @@ class CoordinatorServer:
             "completed_frames": job.completed_frames,
             "frame_start": job.frame_start,  # BUG FIX: Missing frame_start
             "frame_end": job.frame_end,      # BUG FIX: Missing frame_end
+            "output_directory": str(job.output_directory),
             "tasks": [
                 {
                     "id": t.id,
                     "frame_number": t.frame_number,
                     "status": t.status,
+                    "assigned_worker": t.assigned_worker,
+                    "failures": t.failures,
+                    "error_message": t.error_message,
+                    "output_file": str(t.output_file) if t.output_file else None,
                 }
                 for t in job.tasks
             ],
         }
-        print(f"[DEBUG] _api_get_job returning: {result}")
         return result
 
     async def _api_start_job(self, job_id: str) -> dict:
@@ -840,22 +786,49 @@ class CoordinatorServer:
         if job.status == "running":
             return {"status": "already_running"}
 
+        if job.status == JobStatus.PAUSED:
+            return await self._api_resume_job(job_id)
+        if job.status != JobStatus.PENDING:
+            raise HTTPException(status_code=409, detail="Only a pending job can start")
+        self._check_job_can_run(job)
+        self._change_job(job, status=JobStatus.RUNNING, started_at=datetime.now(), completed_at=None)
+        return {"status": "running"}
+
+    def _check_job_can_run(self, job):
+        self._check_not_preparing(job.id)
         # Check job dependencies
         can_start, reason = self._check_job_dependencies(job)
         if not can_start:
             raise HTTPException(status_code=400, detail=f"Cannot start job: {reason}")
 
         # Check scheduled time
-        if job.scheduled_time and job.scheduled_time > datetime.now():
+        if job.scheduled_time and job.scheduled_time > datetime.now(job.scheduled_time.tzinfo):
             raise HTTPException(
                 status_code=400,
                 detail=f"Job is scheduled for {job.scheduled_time.isoformat()}"
             )
 
-        job.start()
-        print(f"▶️  Job {job.name} started")
-        await self._broadcast_update("jobs")
-        return {"status": "running"}
+        count = sum(j.status == JobStatus.RUNNING for j in self.jobs.values())
+        can_accept, reason = self.resource_manager.can_coordinator_accept_job(count)
+        if not can_accept:
+            raise HTTPException(status_code=503, detail=reason)
+
+    def _check_not_preparing(self, job_id):
+        if job_id in self._preparing_jobs:
+            raise HTTPException(status_code=409, detail="Job scene is being prepared")
+
+    def _change_job_state(self, job, status):
+        active = [task for task in job.tasks if task.status in ACTIVE_TASKS]
+        replacements = []
+        for task in active:
+            updated = task.model_copy()
+            updated.reset()
+            replacements.append(updated)
+        self._change_job(job, status=status, tasks=replacements,
+                         completed_at=datetime.now() if status == JobStatus.CANCELLED else None)
+        for task in active:
+            self._release_task_worker(task)
+            task.reset()
 
     async def _api_pause_job(self, job_id: str) -> dict:
         """API: Pause a job."""
@@ -863,9 +836,9 @@ class CoordinatorServer:
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
 
-        job.pause()
-        print(f"⏸️  Job {job.name} paused")
-        await self._broadcast_update("jobs")
+        if job.status not in (JobStatus.RUNNING, JobStatus.PAUSED):
+            raise HTTPException(status_code=409, detail="Only running jobs can pause")
+        self._change_job_state(job, JobStatus.PAUSED)
         return {"status": "paused"}
 
     async def _api_resume_job(self, job_id: str) -> dict:
@@ -874,9 +847,10 @@ class CoordinatorServer:
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
 
-        job.resume()
-        print(f"▶️  Job {job.name} resumed")
-        await self._broadcast_update("jobs")
+        if job.status != JobStatus.PAUSED:
+            raise HTTPException(status_code=409, detail="Only paused jobs can resume")
+        self._check_job_can_run(job)
+        self._change_job(job, status=JobStatus.RUNNING, started_at=job.started_at or datetime.now())
         return {"status": "running"}
 
     async def _api_cancel_job(self, job_id: str) -> dict:
@@ -885,14 +859,11 @@ class CoordinatorServer:
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
 
-        # Reset all pending tasks
-        for task in job.tasks:
-            if task.status != TaskStatus.COMPLETED:
-                task.reset()
-
-        job.status = "cancelled"
-        print(f"❌ Job {job.name} cancelled")
-        await self._broadcast_update("jobs")
+        self._check_not_preparing(job.id)
+        if job.status in (JobStatus.COMPLETED, JobStatus.FAILED):
+            raise HTTPException(status_code=409, detail="Job already finished")
+        if job.status != JobStatus.CANCELLED:
+            self._change_job_state(job, JobStatus.CANCELLED)
         return {"status": "cancelled"}
 
     async def _api_pause_all_jobs(self) -> dict:
@@ -900,19 +871,18 @@ class CoordinatorServer:
         paused_count = 0
         for job in self.jobs.values():
             if job.status == JobStatus.RUNNING:
-                job.pause()
+                self._change_job_state(job, JobStatus.PAUSED)
                 paused_count += 1
                 print(f"⏸️  Job {job.name} paused")
         
-        await self._broadcast_update("jobs")
         return {"status": "success", "paused_count": paused_count}
 
     async def _api_update_job(self, job_id: str, request: UpdateJobRequest) -> dict:
         """API: Update job properties (frame range)."""
-        print(f"[DEBUG] _api_update_job called with job_id={job_id}, request={request}")
         job = self.jobs.get(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
+        self._check_not_preparing(job_id)
 
         # Check if job is in a state that allows updates
         if job.status in ["running"]:
@@ -926,25 +896,29 @@ class CoordinatorServer:
         new_end = request.end_frame if request.end_frame is not None else job.frame_end
 
         # Validate frame range
-        if new_start > new_end:
-            raise HTTPException(
-                status_code=400,
-                detail="start_frame must be less than or equal to end_frame"
-            )
+        try:
+            validate_frame_range(new_start, new_end)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        # Update job frame range
-        job.frame_start = new_start
-        job.frame_end = new_end
-
-        # Regenerate tasks for new frame range
-        job.create_tasks()
-
-        # Reset job status if it was completed
-        if job.status == "completed":
-            job.status = "pending"
-
-        print(f"📝 Job {job.name} updated: frames {new_start}-{new_end}")
-        await self._broadcast_update("jobs")
+        if (new_start, new_end) != (job.frame_start, job.frame_end):
+            previous = job.tasks
+            completed = {t.frame_number: t for t in previous if t.status == TaskStatus.COMPLETED}
+            tasks = [completed.get(n) or FrameTask(frame_number=n)
+                     for n in range(new_start, new_end + 1)]
+            status = JobStatus.PENDING if job.status in TERMINAL_JOBS else job.status
+            ended = None
+            if all(t.status == TaskStatus.COMPLETED for t in tasks):
+                status, ended = JobStatus.COMPLETED, datetime.now()
+            output_directory = job.output_directory
+            if not output_directory.is_relative_to(self._job_dir(job.id)):
+                output_directory = self._job_dir(job.id) / "frames"
+            self._change_job(job, tasks=tasks, replace_tasks=True, frame_start=new_start,
+                             frame_end=new_end, status=status, completed_at=ended,
+                             output_directory=output_directory)
+            for task in previous:
+                if task.status in ACTIVE_TASKS:
+                    self._release_task_worker(task)
 
         return {
             "id": job.id,
@@ -963,66 +937,28 @@ class CoordinatorServer:
         blend: UploadFile = File(...),
     ) -> dict:
         """API: Re-upload and replace a job's blend file."""
-        print(f"[DEBUG] _api_reload_blend called with job_id={job_id}, blend.filename={blend.filename}")
         job = self.jobs.get(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
+        self._check_not_preparing(job_id)
+        if job.status == JobStatus.RUNNING:
+            raise HTTPException(status_code=400, detail="Pause the job before replacing its scene")
 
-        # Validate file extension
-        if not blend.filename or not blend.filename.lower().endswith(".blend"):
-            raise HTTPException(
-                status_code=400,
-                detail="File must be a .blend file"
-            )
-
-        # Check if job is in a state that allows updates
-        if job.status in ["running"]:
-            raise HTTPException(
-                status_code=400,
-                detail="Cannot reload blend file while job is running. Pause the job first."
-            )
-
-        # Save new blend file with sanitized filename
-        safe_filename = BlendFileValidator.sanitize_filename(blend.filename)
-        temp_dir = Path(tempfile.gettempdir()) / "werender" / "jobs"
-        temp_dir.mkdir(parents=True, exist_ok=True)
-
-        new_blend_path = temp_dir / safe_filename
-        with open(new_blend_path, "wb") as f:
-            shutil.copyfileobj(blend.file, f)
-        
-        # Validate the .blend file for security
-        is_valid, error_msg = BlendFileValidator.validate_blend_file(new_blend_path)
-        if not is_valid:
-            new_blend_path.unlink()  # Delete the invalid file
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid .blend file: {error_msg}"
-            )
-        
-        # Replace existing blend file
-        job.blend_file = new_blend_path
-
-        # Pack resources
-        print(f"📦 Packing resources for job {job.id}...")
+        directory = self._job_dir(job.id) / uuid4().hex
+        self._preparing_jobs.add(job.id)
         try:
-            renderer = BlenderRenderer()
-            job.packed_file = renderer.pack_resources(new_blend_path)
-            job.blender_version = renderer.get_version()
-            print(f"✅ Resources packed for job {job.id}")
-        except Exception as e:
-            print(f"⚠️  Warning: Failed to pack resources: {e}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to pack resources: {e}"
-            )
-
-        # Reset job status and tasks
-        job.status = "pending"
-        job.create_tasks()
-
-        print(f"🔄 Blend file reloaded for job {job.name}")
-        await self._broadcast_update("jobs")
+            source, packed, version, digest = await self._prepare_scene(blend, directory, require_pack=True)
+            previous = job.tasks
+            tasks = [FrameTask(frame_number=n) for n in range(job.frame_start, job.frame_end + 1)]
+            self._change_job(job, tasks=tasks, replace_tasks=True, blend_file=source,
+                             packed_file=packed, blender_version=version, blend_file_hash=digest,
+                             status=JobStatus.PENDING, output_directory=directory / "frames",
+                             started_at=None, completed_at=None)
+            for task in previous:
+                if task.status in ACTIVE_TASKS:
+                    self._release_task_worker(task)
+        finally:
+            self._preparing_jobs.discard(job.id)
 
         return {
             "status": "success",
@@ -1051,6 +987,7 @@ class CoordinatorServer:
                 "worker_name": w.worker_name,
                 "cpu_cores": w.cpu_cores,
                 "gpu_name": w.gpu_name,
+                "blender_version": w.blender_version,
                 "current_task_id": w.current_task_id,
                 "current_frame": current_frame,
                 "last_seen": w.last_seen,
@@ -1107,7 +1044,11 @@ class CoordinatorServer:
     async def _api_create_template(self, template_data: dict) -> dict:
         """API: Create a new template."""
         from werender.core.job_templates import JobTemplate
-        template = JobTemplate(**template_data)
+        try:
+            template = JobTemplate(**template_data)
+            template.check_supported()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         self.template_manager.save_template(template)
         return template.model_dump()
 
@@ -1143,49 +1084,20 @@ class CoordinatorServer:
         file: UploadFile = File(...),
         blend_file: Optional[UploadFile] = File(None),
     ) -> dict:
-        """API: Import job from configuration."""
-        import json
-        
-        # Read job config
-        config_data = await file.read()
-        config = json.loads(config_data.decode())
-
-        # If blend file provided, use it; otherwise require existing file path
-        if blend_file:
-            safe_filename = BlendFileValidator.sanitize_filename(blend_file.filename or "unnamed.blend")
-            temp_dir = Path(tempfile.gettempdir()) / "werender" / "jobs"
-            temp_dir.mkdir(parents=True, exist_ok=True)
-            blend_path = temp_dir / safe_filename
-            
-            with open(blend_path, "wb") as f:
-                shutil.copyfileobj(blend_file.file, f)
-            
-            # Validate blend file
-            is_valid, error_msg = BlendFileValidator.validate_blend_file(blend_path)
-            if not is_valid:
-                blend_path.unlink()
-                raise HTTPException(status_code=400, detail=f"Invalid .blend file: {error_msg}")
-        else:
-            # Try to use path from config
-            blend_path = Path(config.get("blend_file_path", ""))
-            if not blend_path.exists():
-                raise HTTPException(status_code=400, detail="Blend file not found and not provided")
-
-        # Create job from config
-        job = JobExporter.create_job_from_config(config, blend_path)
-        
-        # Pack resources
+        """API: Import job from configuration and an uploaded scene."""
+        if blend_file is None:
+            raise HTTPException(status_code=400, detail="Import requires an uploaded .blend file")
+        config_data = await file.read(1024 * 1024 + 1)
+        if len(config_data) > 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Job configuration is too large")
         try:
-            renderer = BlenderRenderer()
-            job.packed_file = renderer.pack_resources(blend_path)
-            job.blender_version = renderer.get_version()
-        except Exception as e:
-            print(f"⚠️  Warning: Failed to pack resources: {e}")
-
-        self.jobs[job.id] = job
-        self._save_job_to_db(job)
-        await self._broadcast_update("jobs")
-        
+            config = json.loads(config_data)
+            if not isinstance(config, dict):
+                raise ValueError("Expected a JSON object")
+            job = JobExporter.create_job_from_config(config, Path("scene.blend"), create_tasks=False)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid job configuration: {exc}") from exc
+        await self._prepare_new_job(job, blend_file)
         return {"job_id": job.id, "status": "imported"}
 
     # ========== Resource Management Endpoints ==========
@@ -1216,16 +1128,20 @@ class CoordinatorServer:
         
         from werender.core.resource_manager import WorkerResourceLimits
         
-        limits = WorkerResourceLimits(
-            max_concurrent_tasks=limits_data.get("max_concurrent_tasks", 1),
-            max_memory_per_task_gb=limits_data.get("max_memory_per_task_gb"),
-            cpu_utilization_cap=limits_data.get("cpu_utilization_cap", 1.0),
-            gpu_utilization_cap=limits_data.get("gpu_utilization_cap", 1.0),
-            reserved_for_jobs=set(limits_data.get("reserved_for_jobs", [])),
-            tags=set(limits_data.get("tags", [])),
-        )
+        try:
+            limits = WorkerResourceLimits(
+                max_concurrent_tasks=limits_data.get("max_concurrent_tasks", 1),
+                max_memory_per_task_gb=limits_data.get("max_memory_per_task_gb"),
+                cpu_utilization_cap=limits_data.get("cpu_utilization_cap", 1.0),
+                gpu_utilization_cap=limits_data.get("gpu_utilization_cap", 1.0),
+                reserved_for_jobs=set(limits_data.get("reserved_for_jobs", [])),
+                tags=set(limits_data.get("tags", [])),
+            )
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         
         self.resource_manager.set_worker_limits(worker_id, limits)
+        self.workers[worker_id].tags = limits.tags
         return {"status": "updated"}
 
     async def _api_reserve_worker(self, worker_id: str, job_id: str = Query(...)) -> dict:
@@ -1260,57 +1176,109 @@ class CoordinatorServer:
 
         return True, None
 
-    async def _websocket_endpoint(self, websocket: WebSocket) -> None:
-
-        """WebSocket endpoint for real-time updates."""
-        await websocket.accept()
-        self.websocket_connections.append(websocket)
-
-        try:
-            while True:
-                # Keep connection alive
-                await websocket.receive_text()
-        except WebSocketDisconnect:
-            self.websocket_connections.remove(websocket)
-
-    async def _broadcast_update(self, update_type: str) -> None:
-        """Broadcast update to all connected WebSocket clients."""
-        if not self.websocket_connections:
-            return
-
-        data = {"type": update_type}
-
-        if update_type in ["jobs", "all"]:
-            data["jobs"] = await self._api_list_jobs()
-
-        if update_type in ["workers", "all"]:
-            data["workers"] = await self._api_list_workers()
-
-        # Send to all connected clients
-        disconnected = []
-        for websocket in self.websocket_connections:
-            try:
-                await websocket.send_json(data)
-            except Exception:
-                disconnected.append(websocket)
-
-        # Remove disconnected clients
-        for ws in disconnected:
-            if ws in self.websocket_connections:
-                self.websocket_connections.remove(ws)
+    @staticmethod
+    def _scene_file(job: RenderJob) -> Path | None:
+        for path in (job.packed_file, job.blend_file):
+            if path and path.is_file():
+                return path
+        return None
 
     def _get_blend_file_hash(self, job: RenderJob) -> str:
-        """Get hash of blend file."""
-        blend_file = job.packed_file or job.blend_file
-        hash_md5 = hashlib.md5()
-        with open(blend_file, "rb") as f:
-            for chunk in iter(lambda: f.read(4096), b""):
-                hash_md5.update(chunk)
-        return hash_md5.hexdigest()
+        path = self._scene_file(job)
+        if not path:
+            raise FileNotFoundError("Blend file missing")
+        return self._hash_scene(path)
+
+    @staticmethod
+    def _hash_scene(path: Path) -> str:
+        # Keep the legacy worker cache/transfer protocol compatible.
+        digest = hashlib.md5(usedforsecurity=False)
+        with path.open("rb") as reader:
+            for chunk in iter(lambda: reader.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _copy_bounded(reader, writer, limit):
+        while block := reader.read(1024 * 1024):
+            limit -= len(block)
+            if limit < 0:
+                raise ValueError("Upload too large")
+            writer.write(block)
+
+    @classmethod
+    def _stage_png(cls, reader, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("x+b") as target:
+            cls._copy_bounded(reader, target, 256 * 1024 * 1024)
+            target.seek(0)
+            cls._verify_png(target)
+
+    @staticmethod
+    def _verify_png(reader) -> None:
+        """Validate Blender's non-interlaced grayscale, RGB and RGBA PNG results."""
+        def read_exact(size):
+            data = reader.read(size)
+            if len(data) != size:
+                raise ValueError("Truncated PNG")
+            return data
+
+        if read_exact(8) != b"\x89PNG\r\n\x1a\n":
+            raise ValueError("Missing PNG signature")
+        if read_exact(8) != b"\x00\x00\x00\rIHDR":
+            raise ValueError("Missing PNG header")
+        header = read_exact(13)
+        if struct.unpack(">I", read_exact(4))[0] != zlib.crc32(b"IHDR" + header):
+            raise ValueError("Bad PNG header checksum")
+        width, height, depth, color, comp, filters, interlace = struct.unpack(">IIBBBBB", header)
+        channels = {0: 1, 2: 3, 4: 2, 6: 4}.get(color)
+        if not channels or depth not in (8, 16) or comp or filters or interlace or not width or not height:
+            raise ValueError("Unsupported PNG header")
+        stride = 1 + width * channels * (depth // 8)
+        expected = height * stride
+        if expected > 512 * 1024 * 1024:
+            raise ValueError("Decoded PNG too large")
+        decoder = zlib.decompressobj()
+        decoded = 0
+        saw_data = data_ended = False
+        while True:
+            size, kind = struct.unpack(">I4s", read_exact(8))
+            if not kind.isalpha():
+                raise ValueError("Invalid PNG chunk type")
+            if kind == b"IDAT":
+                if data_ended:
+                    raise ValueError("Nonconsecutive PNG image data")
+                saw_data = True
+            elif kind not in (b"IEND", b"PLTE") and kind[:1].isupper():
+                raise ValueError("Unexpected critical PNG chunk")
+            else:
+                data_ended = saw_data
+            if kind == b"IEND" and size:
+                raise ValueError("Invalid PNG end chunk")
+            crc = zlib.crc32(kind)
+            while size:
+                block = read_exact(min(size, 64 * 1024))
+                size -= len(block)
+                crc = zlib.crc32(block, crc)
+                if kind == b"IDAT":
+                    while block:
+                        raw = decoder.decompress(block, 64 * 1024)
+                        if decoder.unused_data or any(value > 4 for value in raw[(-decoded) % stride::stride]):
+                            raise ValueError("Invalid PNG scanline data")
+                        decoded += len(raw)
+                        if decoded > expected:
+                            raise ValueError("Unexpected PNG pixel count")
+                        block = decoder.unconsumed_tail
+            if struct.unpack(">I", read_exact(4))[0] != crc:
+                raise ValueError("Bad PNG chunk checksum")
+            if kind == b"IEND":
+                if not saw_data or not decoder.eof or decoded != expected or reader.read(1):
+                    raise ValueError("Incomplete or oversized PNG")
+                return
 
     def run(self) -> None:
         """Run the coordinator server."""
-        print(f"🎬 WeRender - Coordinator Mode")
+        print("🎬 WeRender - Coordinator Mode")
         print("=" * 50)
         print(f"🖥️  Hostname: {self.specs.hostname}")
         print(f"🆔 Node ID: {self.node_id}")
@@ -1319,8 +1287,9 @@ class CoordinatorServer:
         print(f"🎨 Blender: {self.blender_version or 'Not found'}")
         print()
         print(f"🌐 Server running on http://0.0.0.0:{self.port}")
-        print(f"📡 Advertising via mDNS")
-        print(f"🔒 Authentication enabled - workers require API key")
+        if not getattr(self, "direct_only", False):
+            print("📡 Advertising via mDNS")
+        print("🔒 Authentication enabled - workers require API key")
         print()
 
         # Print authentication setup instructions

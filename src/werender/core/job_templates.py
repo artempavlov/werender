@@ -31,7 +31,7 @@ class JobPreset(str, Enum):
 class JobTemplate(BaseModel):
     """A reusable job template."""
 
-    id: str = Field(default_factory=lambda: str(uuid4())[:8])
+    id: str = Field(default_factory=lambda: uuid4().hex, pattern=r"^[a-zA-Z0-9_-]{1,64}$")
     """Unique template identifier."""
 
     name: str
@@ -66,58 +66,45 @@ class JobTemplate(BaseModel):
         """Create template from built-in preset."""
         presets = {
             JobPreset.ANIMATION: cls(
-                name="Animation (High Quality)",
-                description="Full animation render with high quality settings",
+                name="Animation",
+                description="High scheduling priority; scene render settings are unchanged",
                 priority=7,
                 requires_gpu=True,
                 min_memory_gb=8.0,
-                render_settings={
-                    "samples": 256,
-                    "resolution_percentage": 100,
-                },
-                output_format="EXR",
             ),
             JobPreset.STILL: cls(
-                name="Still (Production Quality)",
-                description="Single frame production render",
+                name="Still",
+                description="Very high scheduling priority; scene render settings are unchanged",
                 priority=8,
                 requires_gpu=True,
                 min_memory_gb=16.0,
-                render_settings={
-                    "samples": 512,
-                    "resolution_percentage": 100,
-                },
-                output_format="EXR",
             ),
             JobPreset.TEST: cls(
                 name="Test Render",
-                description="Quick test render with low quality",
+                description="Low scheduling priority; scene render settings are unchanged",
                 priority=3,
                 requires_gpu=False,
                 min_memory_gb=2.0,
-                render_settings={
-                    "samples": 32,
-                    "resolution_percentage": 50,
-                },
                 output_format="PNG",
             ),
             JobPreset.PREVIEW: cls(
                 name="Preview",
-                description="Preview render with medium quality",
+                description="Normal scheduling priority; scene render settings are unchanged",
                 priority=5,
                 requires_gpu=False,
                 min_memory_gb=4.0,
-                render_settings={
-                    "samples": 128,
-                    "resolution_percentage": 75,
-                },
                 output_format="PNG",
             ),
         }
         return presets[preset]
 
+    def check_supported(self) -> None:
+        if self.render_settings or self.output_format != "PNG":
+            raise ValueError("Render overrides are not supported; only PNG results are supported")
+
     def apply_to_job(self, job: RenderJob) -> RenderJob:
         """Apply template settings to a job."""
+        self.check_supported()
         job.priority = self.priority
         job.requires_gpu = self.requires_gpu
         job.min_memory_gb = self.min_memory_gb
@@ -153,10 +140,10 @@ class JobTemplateManager:
 
     def save_template(self, template: JobTemplate) -> None:
         """Save a template to disk."""
-        self._templates[template.id] = template
         template_file = self.templates_dir / f"{template.id}.json"
         with open(template_file, "w") as f:
-            json.dump(template.model_dump(), f, indent=2, default=str)
+            json.dump(template.model_dump(mode="json"), f, indent=2)
+        self._templates[template.id] = template
 
     def get_template(self, template_id: str) -> Optional[JobTemplate]:
         """Get a template by ID."""
@@ -209,6 +196,8 @@ class JobExporter:
             "requires_gpu": job.requires_gpu,
             "min_memory_gb": job.min_memory_gb,
             "worker_tags": list(job.worker_tags),
+            "depends_on": list(job.depends_on),
+            "scheduled_time": job.scheduled_time.isoformat() if job.scheduled_time else None,
             "output_directory": str(job.output_directory),
             "blender_version": job.blender_version,
             "created_at": job.created_at.isoformat(),
@@ -240,7 +229,7 @@ class JobExporter:
             return json.load(f)
 
     @staticmethod
-    def create_job_from_config(config: Dict[str, Any], blend_file: Path) -> RenderJob:
+    def create_job_from_config(config: Dict[str, Any], blend_file: Path, *, create_tasks=True) -> RenderJob:
         """
         Create a job from exported configuration.
 
@@ -251,8 +240,9 @@ class JobExporter:
         Returns:
             New RenderJob instance
         """
+        if config.get("render_settings") or config.get("output_format", "PNG") != "PNG":
+            raise ValueError("Render overrides are not supported; only PNG results are supported")
         job = RenderJob(
-            id=config.get("id", str(uuid4())[:8]),
             name=config.get("name", ""),
             blend_file=blend_file,
             frame_start=config["frame_start"],
@@ -260,8 +250,9 @@ class JobExporter:
             priority=config.get("priority", 5),
             requires_gpu=config.get("requires_gpu", False),
             min_memory_gb=config.get("min_memory_gb"),
-            worker_tags=set(config.get("worker_tags", [])),
-            output_directory=Path(config.get("output_directory", "./output")),
+            worker_tags=config.get("worker_tags", []),
+            depends_on=config.get("depends_on", []),
+            scheduled_time=config.get("scheduled_time"),
             blender_version=config.get("blender_version", ""),
         )
 
@@ -272,5 +263,6 @@ class JobExporter:
             except Exception:
                 pass
 
-        job.create_tasks()
+        if create_tasks:
+            job.create_tasks()
         return job

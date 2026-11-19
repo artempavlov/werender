@@ -1,4 +1,6 @@
 import json
+import struct
+import zlib
 from unittest.mock import AsyncMock
 
 import httpx
@@ -7,7 +9,28 @@ import pytest
 from werender.core.job import RenderJob, TaskStatus
 from werender.network.coordinator import CoordinatorServer, WorkerInfo
 from werender.network.discovery import NodeInfo
-from werender.network.worker import WorkerNode
+from werender.network.worker import TaskReportTimeout, WorkerNode
+
+
+def _png_chunk(kind, data):
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+
+PNG = (
+    b"\x89PNG\r\n\x1a\n"
+    + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+    + _png_chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00"))
+    + _png_chunk(b"IEND", b"")
+)
+
+
+async def test_persistent_upload_failure_releases_retry_loop(monkeypatch):
+    monkeypatch.setattr("werender.network.worker.TASK_REPORT_TIMEOUT", 0.05)
+    worker = WorkerNode.__new__(WorkerNode)
+    send = AsyncMock(return_value=httpx.Response(503))
+    with pytest.raises(TaskReportTimeout, match="upload timed out"):
+        await worker._retry_task_report(send, {"frame_number": 77}, "upload")
+    send.assert_awaited()
 
 
 @pytest.fixture
@@ -36,14 +59,14 @@ def farm(tmp_path, monkeypatch):
 async def test_upload_retries_after_disconnect_503_and_lost_ack(farm, tmp_path, monkeypatch):
     coordinator, worker, first, second, assignment = farm
     output = tmp_path / "render.png"
-    output.write_bytes(b"rendered output")
+    output.write_bytes(PNG)
     sleep = AsyncMock()
     monkeypatch.setattr("werender.network.worker.asyncio.sleep", sleep)
     seen = []
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=coordinator.app)) as api:
         async def deliver(request):
             body = await request.aread()
-            assert b"rendered output" in body
+            assert PNG in body
             seen.append(body)
             if len(seen) == 1:
                 raise httpx.WriteError("", request=request)
@@ -88,7 +111,7 @@ async def test_old_upload_cannot_complete_new_assignment(farm):
 async def test_permanent_rejection_reports_failure_and_frees_worker(farm, tmp_path, monkeypatch):
     coordinator, worker, first, _, assignment = farm
     output = tmp_path / "render.png"
-    output.write_bytes(b"rendered output")
+    output.write_bytes(PNG)
     monkeypatch.setattr("werender.network.worker.asyncio.sleep", AsyncMock())
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=coordinator.app)) as api:
         reports = []
@@ -104,6 +127,7 @@ async def test_permanent_rejection_reports_failure_and_frees_worker(farm, tmp_pa
         async with httpx.AsyncClient(transport=httpx.MockTransport(deliver)) as worker.http_client:
             await worker._upload_result("http://farm.test", assignment, output, 1.0)
     assert len(reports) == 2
-    assert first.status == TaskStatus.FAILED
+    assert first.status == TaskStatus.PENDING
+    assert first.failures == 1
     assert first.error_message == "Upload refused: HTTP 413"
     assert coordinator.workers["worker"].current_task_id is None

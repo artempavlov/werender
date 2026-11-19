@@ -1,6 +1,7 @@
 """Comprehensive tests for discovery service."""
 
 import time
+from zeroconf import ServiceStateChange
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -316,9 +317,9 @@ class TestDiscoveryServiceHandleServiceRemoved:
 
         callback = Mock()
         service.on_removal = callback
+        service.zeroconf = Mock()
 
-        with service._lock:
-            service._handle_service_removed("Node1")
+        service._handle_service_removed("Node1")
 
         assert "node-1" not in service.discovered_nodes
         callback.assert_called_once_with(node)
@@ -351,7 +352,7 @@ class TestDiscoveryServiceOnServiceStateChange:
         mock_zeroconf = Mock()
         mock_info = Mock()
         mock_info.name = "new-service"
-        mock_info.addresses = [b"\x7f\x00\x00\x01"]
+        mock_info.parsed_addresses.return_value = ["127.0.0.1"]
         mock_info.port = 9000
         mock_info.properties = {
             b"node_id": b"new-node",
@@ -360,7 +361,8 @@ class TestDiscoveryServiceOnServiceStateChange:
         }
         mock_zeroconf.get_service_info.return_value = mock_info
 
-        service._on_service_state_change(mock_zeroconf, "_werender._tcp.local.", "new-service", "Added")
+        service.zeroconf = mock_zeroconf
+        service._on_service_state_change(mock_zeroconf, "_werender._tcp.local.", "new-service", ServiceStateChange.Added)
 
         assert len(service.discovered_nodes) == 1
         assert "new-node" in service.discovered_nodes
@@ -380,8 +382,8 @@ class TestDiscoveryServiceOnServiceStateChange:
         )
         service.discovered_nodes["node-1"] = node
 
-        with service._lock:
-            service._on_service_state_change(Mock(), "_werender._tcp.local.", "Node1", "Removed")
+        service.zeroconf = Mock()
+        service._on_service_state_change(service.zeroconf, "_werender._tcp.local.", "Node1", ServiceStateChange.Removed)
 
         assert "node-1" not in service.discovered_nodes
 
@@ -396,8 +398,9 @@ class TestDiscoveryServiceOnServiceStateChange:
         mock_zeroconf = Mock()
         mock_zeroconf.get_service_info.return_value = None
 
+        service.zeroconf = mock_zeroconf
         service._on_service_state_change(
-            mock_zeroconf, "_werender._tcp.local.", "some-service", "Added"
+            mock_zeroconf, "_werender._tcp.local.", "some-service", ServiceStateChange.Added
         )
 
         assert len(service.discovered_nodes) == 0
@@ -434,7 +437,7 @@ class TestDiscoveryServiceHandleServiceAdded:
 
         mock_info = Mock()
         mock_info.name = "other-service"
-        mock_info.addresses = []
+        mock_info.parsed_addresses.return_value = []
         mock_info.port = 9000
         mock_info.properties = {b"node_type": b"coordinator", b"node_id": b"coord-1"}
 
@@ -470,10 +473,11 @@ class TestDiscoveryServiceHandleServiceAdded:
 
         callback = Mock()
         service.on_discovery = callback
+        service.zeroconf = Mock()
 
         mock_info = Mock()
         mock_info.name = "other-service"
-        mock_info.addresses = [b"\x7f\x00\x00\x01"]
+        mock_info.parsed_addresses.return_value = ["127.0.0.1"]
         mock_info.port = 9000
         mock_info.properties = {
             b"node_type": b"coordinator",
@@ -509,7 +513,7 @@ class TestDiscoveryServiceHandleServiceAdded:
 
         mock_info = Mock()
         mock_info.name = "Node1"
-        mock_info.addresses = [b"\x7f\x00\x00\x01"]
+        mock_info.parsed_addresses.return_value = ["127.0.0.1"]
         mock_info.port = 9000
         mock_info.properties = {
             b"node_type": b"coordinator",
@@ -517,9 +521,7 @@ class TestDiscoveryServiceHandleServiceAdded:
             b"hostname": b"coord-host",
         }
 
-        with service._lock:
-            time.sleep(0.01)
-            service._handle_service_added(mock_info)
+        service._handle_service_added(mock_info)
 
         # Should update last_seen but not call callback
         assert callback.call_count == 0

@@ -7,7 +7,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from werender.core.blender import BlenderNotFoundError, BlenderRenderer
+from werender.core.blender import BlenderNotFoundError, BlenderRenderer, BlenderVersionError
 from werender.network.coordinator import CoordinatorServer
 from werender.network.worker import WorkerNode
 
@@ -35,7 +35,7 @@ def cmd_render(args: argparse.Namespace) -> int:
         renderer = BlenderRenderer(args.blender or "blender")
         version = renderer.get_version()
         print(f"✓ Found Blender {version}")
-    except BlenderNotFoundError as e:
+    except (BlenderNotFoundError, BlenderVersionError) as e:
         print(f"❌ {e}")
         return 1
 
@@ -102,7 +102,7 @@ def cmd_info(args: argparse.Namespace) -> int:
         renderer = BlenderRenderer()
         version = renderer.get_version()
         print(f"🎨 Blender: {version} ✓")
-    except BlenderNotFoundError:
+    except (BlenderNotFoundError, BlenderVersionError):
         print(f"🎨 Blender: Not found ✗")
 
     return 0

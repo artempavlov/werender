@@ -1,13 +1,32 @@
 """Security utilities for WeRender."""
 
-import struct
+import gzip
 import hashlib
+import re
 from pathlib import Path
 from typing import Optional, Tuple
 
 
+def new_file_hasher(expected_hash: str):
+    """Select the declared digest; MD5 is for legacy transfer compatibility only."""
+    if isinstance(expected_hash, str):
+        if re.fullmatch(r"[0-9a-fA-F]{64}", expected_hash):
+            return hashlib.sha256()
+        if re.fullmatch(r"[0-9a-fA-F]{32}", expected_hash):
+            return hashlib.md5(usedforsecurity=False)
+    raise ValueError("Expected a SHA-256 or legacy MD5 hex digest")
+
+
+def matches_file_hash(path: Path, expected_hash: str) -> bool:
+    digest = new_file_hasher(expected_hash)
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest() == expected_hash.lower()
+
+
 class BlendFileValidator:
-    """Validates .blend files for security."""
+    """Check file size and Blender header format, not scene safety."""
 
     # Magic bytes for .blend files
     BLEND_MAGIC = b'BLENDER'
@@ -48,26 +67,26 @@ class BlendFileValidator:
         # Validate magic bytes
         try:
             with open(file_path, 'rb') as f:
-                header = f.read(BlendFileValidator.HEADER_SIZE)
-                
-                # Check BLENDER magic bytes
+                header = f.read(17)
+                f.seek(0)
+                if header.startswith(b"\x1f\x8b"):
+                    with gzip.GzipFile(fileobj=f) as reader:
+                        header = reader.read(17)
+                elif header.startswith(b"\x28\xb5\x2f\xfd"):
+                    try:
+                        import zstandard
+                    except ImportError:
+                        return False, "Zstandard-compressed .blend validation requires the zstandard Python package; save uncompressed or install zstandard"
+                    with zstandard.ZstdDecompressor(max_window_size=2**27).stream_reader(f) as reader:
+                        header = reader.read(17)
+
                 if not header.startswith(BlendFileValidator.BLEND_MAGIC):
                     return False, "Invalid .blend file: missing magic bytes"
-                
-                # Extract and validate pointer size
-                pointer_size = header[7:8].decode('ascii', errors='ignore')
-                if pointer_size not in ['_', '-']:
-                    return False, f"Invalid pointer size in .blend file header"
-                
-                # Extract and validate endianness
-                endianness = header[8:9].decode('ascii', errors='ignore')
-                if endianness not in ['v', 'V']:
-                    return False, f"Invalid endianness in .blend file header"
-                
-                # Extract and validate version
-                version = header[9:12].decode('ascii', errors='ignore')
-                if not version.isdigit():
-                    return False, f"Invalid version in .blend file header"
+                if header[7:9].isdigit():
+                    if not re.fullmatch(rb"BLENDER17-01v[0-9]{4}", header):
+                        return False, "Unsupported or invalid extended .blend file header"
+                elif not re.fullmatch(rb"BLENDER[-_][vV][0-9]{3}", header[:12]):
+                    return False, "Invalid pointer size, endianness, or version in .blend file header"
                 
         except Exception as e:
             return False, f"Error reading .blend file header: {e}"

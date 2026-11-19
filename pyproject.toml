@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
@@ -8,7 +8,8 @@ version = "0.2.0b0"
 description = "Zero-Config Peer-to-Peer Distributed Render Manager for Blender"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 keywords = ["blender", "render", "distributed", "render-farm", "network-rendering"]
 authors = [
     { name = "WeRender Team", email = "team@werender.dev" }
@@ -18,7 +19,6 @@ classifiers = [
     "Intended Audience :: End Users/Desktop",
     "Intended Audience :: Developers",
     "Topic :: Multimedia :: Graphics :: 3D Rendering",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -34,8 +34,7 @@ dependencies = [
     "httpx>=0.26.0",
     "pydantic>=2.5.0",
     "python-multipart>=0.0.6",
-    "websockets>=12.0",
-    "aiofiles>=23.0.0",
+    "zstandard>=0.22",
 ]
 
 [project.urls]
@@ -55,12 +54,14 @@ dev = [
 [project.scripts]
 werender = "werender.main:main"
 
+[tool.hatch.build]
+exclude = ["**/__pycache__/", "**/*.py[cod]", "**/.env", "**/api_keys.json"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/werender"]
-artifacts = ["src/werender/dashboard/**"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/werender/**"]
+include = ["src/werender/**", "docs/**", "README.md", "LICENSE", "CHANGELOG.md", "CONTRIBUTING.md"]
 
 [tool.ruff]
 line-length = 100

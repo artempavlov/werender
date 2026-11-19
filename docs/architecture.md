@@ -9,7 +9,7 @@ graph TD
     subgraph Coordinator ["Coordinator (Main PC)"]
         JQ[Job Queue]
         FS[File Server]
-        WSS[WebSocket Server]
+        API[Authenticated HTTP API]
         Dash[Web Dashboard]
         MDNS_C[mDNS Service]
     end
@@ -26,12 +26,13 @@ graph TD
         B_B[Blender Process]
     end
 
-    WorkerA -->|Connects via WebSocket| WSS
-    WorkerB -->|Connects via WebSocket| WSS
+    WorkerA -->|Polls for tasks| API
+    WorkerB -->|Polls for tasks| API
     WorkerA -->|Downloads Assets| FS
     WorkerB -->|Downloads Assets| FS
     
-    Browser[Web Browser] -->|HTTP/WS| Dash
+    Browser[Web Browser] -->|HTTP| Dash
+    Browser -->|Polls for job and worker status| API
 ```
 
 ## Core Concepts
@@ -44,11 +45,8 @@ graph TD
 
 ### 2. Communication Layer
 
-- **WebSocket Protocol**: Used for real-time state management.
-  - Workers send heartbeat signals (resource usage, status).
-  - Coordinator pushes job assignments and cancellation requests.
-  - Real-time logs are streamed back to the Coordinator.
-- **HTTP API**: Used by the Web Dashboard to query state and control jobs.
+- **HTTP API**: Workers poll for tasks, download assets, and report results.
+- **Web dashboard**: Polls the HTTP API for job and worker status and uses it to control jobs.
 
 ### 3. Asset Distribution
 
@@ -65,7 +63,7 @@ graph TD
 
 1. **Job Submission**: User submits `scene.blend` (Frames 1-100) via CLI or Dashboard.
 2. **Packing**: Coordinator packs assets into a single ready-to-render file.
-3. **Announcement**: Coordinator signals "New Job Available" to connected Workers.
+3. **Queueing**: The coordinator makes tasks available to polling workers when the job starts.
 4. **Assignment**: Worker A requests a task. Coordinator assigns Frame 1.
 5. **Downloading**: Worker A downloads the packed `.blend` file (if not already cached).
 6. **Rendering**: Worker A launches a background Blender process to render Frame 1 to a temp file.

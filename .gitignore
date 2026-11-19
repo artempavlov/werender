@@ -144,3 +144,5 @@ test_output.txt
 
 # Release artifacts
 RELEASE_NOTES.md
+.tmp/
+.slim/deepwork/

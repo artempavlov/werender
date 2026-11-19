@@ -122,16 +122,16 @@ The following endpoints require worker authentication:
 - `POST /api/tasks/{task_id}/fail` - Report task failures
 - `GET /api/jobs/{job_id}/blend` - Download blend files
 
-### Unprotected Endpoints
+### Dashboard access
 
-These endpoints remain publicly accessible (for now):
+The dashboard HTML and assets can load without a key, but job and worker data, and job controls,
+require a coordinator key. The dashboard polls the HTTP API rather than using a WebSocket.
+An authenticated reverse proxy may inject the appropriate key server-side; do not embed it in
+HTML or JavaScript. Use HTTPS outside localhost or a trusted private network.
 
-- Job management endpoints (create, start, pause, etc.)
-- Worker listing endpoint
-- Synchronization endpoints
-- WebSocket endpoint for dashboard
-
-**Future Enhancement**: In a future update, these can be protected with separate authentication for web dashboard users.
+Public dashboard dependencies are version-pinned and checked with Subresource Integrity.
+An offline deployment can serve those dependencies locally. If it uses different file bytes,
+its local HTML overlay must update the integrity hashes as well as the asset URLs.
 
 ## Troubleshooting
 

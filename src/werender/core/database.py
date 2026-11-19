@@ -12,7 +12,7 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Dict, List, Any
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 
 class JobStatus(str, Enum):
@@ -56,6 +56,7 @@ class Database:
         """Get database connection with proper transaction handling."""
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
         try:
             yield conn
             conn.commit()
@@ -69,6 +70,7 @@ class Database:
         """Initialize database schema."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
 
             # Jobs table
             cursor.execute("""
@@ -111,6 +113,12 @@ class Database:
             """)
 
             # Workers table
+            columns = {row[1] for row in cursor.execute("PRAGMA table_info(tasks)")}
+            if "failures" not in columns:
+                cursor.execute("ALTER TABLE tasks ADD COLUMN failures INTEGER NOT NULL DEFAULT 0")
+            if "last_failed_assignment" not in columns:
+                cursor.execute("ALTER TABLE tasks ADD COLUMN last_failed_assignment TEXT")
+
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS workers (
                     id TEXT PRIMARY KEY,
@@ -177,24 +185,31 @@ class Database:
 
     # ========== Job Methods ==========
 
-    def save_job(self, job_data: Dict[str, Any]) -> None:
+    def save_job(self, job_data: Dict[str, Any], connection=None) -> None:
         """
         Save or update a job.
 
         Args:
             job_data: Job data dictionary
         """
-        with self._get_connection() as conn:
+        with (nullcontext(connection) if connection is not None else self._get_connection()) as conn:
             cursor = conn.cursor()
 
             metadata_json = json.dumps(job_data.get("metadata", {})) if job_data.get("metadata") else None
 
             cursor.execute("""
-                INSERT OR REPLACE INTO jobs (
+                INSERT INTO jobs (
                     id, name, blend_file_path, packed_file_path, blend_file_hash,
                     frame_start, frame_end, status, priority, created_at,
                     started_at, completed_at, blender_version, metadata, output_dir
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET name=excluded.name,
+                    blend_file_path=excluded.blend_file_path, packed_file_path=excluded.packed_file_path,
+                    blend_file_hash=excluded.blend_file_hash, frame_start=excluded.frame_start,
+                    frame_end=excluded.frame_end, status=excluded.status, priority=excluded.priority,
+                    created_at=excluded.created_at, started_at=excluded.started_at,
+                    completed_at=excluded.completed_at, blender_version=excluded.blender_version,
+                    metadata=excluded.metadata, output_dir=excluded.output_dir
             """, (
                 job_data["id"],
                 job_data.get("name", ""),
@@ -212,6 +227,15 @@ class Database:
                 metadata_json,
                 str(job_data.get("output_dir", "")) if job_data.get("output_dir") else None,
             ))
+
+    def save_job_state(self, job_data, tasks, *, replace_tasks=False) -> None:
+        """Commit job status and the corresponding frame changes together."""
+        with self._get_connection() as conn:
+            self.save_job(job_data, connection=conn)
+            if replace_tasks:
+                conn.execute("DELETE FROM tasks WHERE job_id = ?", (job_data["id"],))
+            for task in tasks:
+                self.save_task(task, connection=conn)
 
     def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -328,22 +352,22 @@ class Database:
 
     # ========== Task Methods ==========
 
-    def save_task(self, task_data: Dict[str, Any]) -> None:
+    def save_task(self, task_data: Dict[str, Any], connection=None) -> None:
         """
         Save or update a task.
 
         Args:
             task_data: Task data dictionary
         """
-        with self._get_connection() as conn:
+        with (nullcontext(connection) if connection is not None else self._get_connection()) as conn:
             cursor = conn.cursor()
 
             cursor.execute("""
                 INSERT OR REPLACE INTO tasks (
                     id, job_id, frame_number, status, assigned_worker,
                     assigned_at, started_at, completed_at, render_time_seconds,
-                    output_file_path, error_message
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    output_file_path, error_message, failures, last_failed_assignment
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 task_data["id"],
                 task_data["job_id"],
@@ -356,6 +380,8 @@ class Database:
                 task_data.get("render_time_seconds"),
                 str(task_data.get("output_file_path", "")) if task_data.get("output_file_path") else None,
                 task_data.get("error_message"),
+                task_data.get("failures", 0),
+                task_data.get("last_failed_assignment"),
             ))
 
     def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
@@ -475,11 +501,21 @@ class Database:
             metadata_json = json.dumps(worker_data.get("metadata", {})) if worker_data.get("metadata") else None
 
             cursor.execute("""
-                INSERT OR REPLACE INTO workers (
+                INSERT INTO workers (
                     id, name, hostname, address, port, cpu_cores, cpu_threads,
                     ram_gb, gpu_name, gpu_vram_gb, blender_version,
                     last_seen, is_online, current_task_id, metadata
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET name=excluded.name,
+                    hostname=COALESCE(excluded.hostname,workers.hostname),
+                    address=COALESCE(excluded.address,workers.address),
+                    port=COALESCE(excluded.port,workers.port),
+                    cpu_cores=excluded.cpu_cores, cpu_threads=COALESCE(excluded.cpu_threads,workers.cpu_threads),
+                    ram_gb=excluded.ram_gb, gpu_name=excluded.gpu_name,
+                    gpu_vram_gb=COALESCE(excluded.gpu_vram_gb,workers.gpu_vram_gb),
+                    blender_version=excluded.blender_version, last_seen=excluded.last_seen,
+                    is_online=excluded.is_online, current_task_id=excluded.current_task_id,
+                    metadata=COALESCE(excluded.metadata,workers.metadata)
             """, (
                 worker_data["id"],
                 worker_data.get("name", ""),
@@ -570,6 +606,10 @@ class Database:
             )
 
     # ========== Statistics Methods ==========
+
+    def mark_workers_offline(self) -> None:
+        with self._get_connection() as conn:
+            conn.execute("UPDATE workers SET is_online = 0, current_task_id = NULL")
 
     def save_worker_stats(self, worker_id: str, stats: Dict[str, Any]) -> None:
         """

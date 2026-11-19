@@ -9,14 +9,15 @@ This module provides optimized file transfer capabilities including:
 
 import asyncio
 import gzip
-import hashlib
 import shutil
+import tempfile
 import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Dict, List
 import httpx
+from werender.network.security import new_file_hasher
 
 
 class CompressionLevel(str, Enum):
@@ -338,6 +339,9 @@ class TransferOptimizer:
         compression: Optional[CompressionLevel] = None,
         headers: Optional[Dict[str, str]] = None,
         progress_callback: Optional[callable] = None,
+        *,
+        expected_hash: Optional[str] = None,
+        expected_size: Optional[int] = None,
     ) -> TransferStats:
         """
         Download a file with optimization.
@@ -354,26 +358,22 @@ class TransferOptimizer:
         Returns:
             TransferStats with transfer information
         """
+        digest = new_file_hasher(expected_hash) if expected_hash is not None else None
         transfer_id = f"download_{id(output_path)}"
         await self.bandwidth_manager.register_transfer(transfer_id, priority)
+        staging = None
 
         try:
             # Determine compression
-            if compression is None:
-                compression = self.quality_detector.get_recommended_compression()
-
-            # Check if URL indicates compression
-            is_compressed = url.endswith(".gz") or (headers and headers.get("Content-Encoding") == "gzip")
+            # A hashed download represents exact file bytes, including any on-disk compression.
+            is_compressed = digest is None and url.endswith(".gz")
+            request_headers = httpx.Headers(headers)
+            if digest is not None:
+                request_headers["Accept-Encoding"] = "identity"
 
             # Calculate chunk size
             # First, get file size from HEAD request if possible
-            file_size = 0
-            try:
-                head_response = await http_client.head(url, headers=headers)
-                if "Content-Length" in head_response.headers:
-                    file_size = int(head_response.headers["Content-Length"])
-            except Exception:
-                pass
+            file_size = expected_size or 0
 
             chunk_size = self.bandwidth_manager.calculate_chunk_size(file_size, priority)
 
@@ -381,21 +381,34 @@ class TransferOptimizer:
             start_time = time.time()
 
             # Download file
-            async with http_client.stream("GET", url, headers=headers) as response:
+            async with http_client.stream("GET", url, headers=request_headers) as response:
                 if response.status_code != 200:
-                    raise Exception(f"HTTP {response.status_code}")
+                    raise ValueError(f"Expected complete download, got HTTP {response.status_code}")
+                identity = response.headers.get("Content-Encoding", "identity").lower() == "identity"
+                if digest is not None and not identity:
+                    raise ValueError("Expected identity Content-Encoding for file verification")
 
                 # Update total size from response if available
-                if "Content-Length" in response.headers:
-                    stats.bytes_total = int(response.headers["Content-Length"])
+                declared = response.headers.get("Content-Length")
+                size = int(declared) if identity and declared is not None else expected_size
+                if expected_size is not None and size != expected_size:
+                    raise ValueError("Download Content-Length disagrees with HEAD")
+                if size is not None and size < 0:
+                    raise ValueError("Invalid Content-Length")
+                stats.bytes_total = size or 0
 
                 output_path.parent.mkdir(parents=True, exist_ok=True)
-                temp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+                staging = tempfile.TemporaryDirectory(prefix=".download-", dir=output_path.parent)
+                temp_path = Path(staging.name) / "payload"
 
                 with open(temp_path, "wb") as f:
                     async for chunk in response.aiter_bytes(chunk_size):
-                        f.write(chunk)
                         stats.bytes_transferred += len(chunk)
+                        if size is not None and stats.bytes_transferred > size:
+                            raise ValueError("Download is longer than declared")
+                        f.write(chunk)
+                        if digest is not None:
+                            digest.update(chunk)
 
                         # Throttle if needed
                         if await self.bandwidth_manager.should_throttle(priority):
@@ -414,18 +427,23 @@ class TransferOptimizer:
                         if progress_callback:
                             progress_callback(stats)
 
-                # Decompress if needed
+                if size is not None and stats.bytes_transferred != size:
+                    raise ValueError("Download is shorter than declared")
+                if digest is not None and digest.hexdigest() != expected_hash.lower():
+                    raise ValueError("Downloaded file digest does not match")
+
                 if is_compressed:
-                    decompressed_path = output_path.with_suffix("")
+                    decompressed_path = Path(staging.name) / "decompressed"
                     self.decompress_file(temp_path, decompressed_path)
-                    temp_path.unlink()
-                    output_path = decompressed_path
+                    decompressed_path.replace(output_path.with_suffix(""))
                 else:
-                    temp_path.rename(output_path)
+                    temp_path.replace(output_path)
 
             return stats
 
         finally:
+            if staging is not None:
+                staging.cleanup()
             await self.bandwidth_manager.unregister_transfer(transfer_id)
 
     async def upload_file(

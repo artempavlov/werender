@@ -131,10 +131,11 @@ export WERENDER_API_KEY="wrk_xxxxxxxxxxxxxxxx"  # Use the key from Step 2
 werender worker
 ```
 
-**Option B: Using shared config directory**
+**Option B: Using a local worker config**
 ```bash
-# Copy the api_keys.json from coordinator to worker
-# Then simply run:
+# On the worker, create ~/.werender/api_keys.json with only the worker key:
+# {"worker": "your_worker_api_key"}
+# Keep the file private (mode 0600 on Unix).
 werender worker
 ```
 
@@ -156,10 +157,15 @@ Open your browser and navigate to:
 http://localhost:8420
 ```
 
+Enter the `coordinator` key from `~/.werender/api_keys.json` and select **Connect**.
+If a trusted reverse proxy signs you in and supplies the API key, leave the field blank.
+Use HTTPS for remote access over untrusted networks. See the [User Guide](docs/user_guide.md)
+for Blender add-on setup.
+
 You'll see:
 - Connected workers with their CPU/RAM usage
 - Job progress (frames completed, remaining, failed)
-- Real-time frame previews as they render
+- Job and worker status refreshed automatically
 
 ### Demo Project
 
@@ -183,7 +189,7 @@ For more detailed instructions and troubleshooting, see the [User Guide](docs/us
 - **[Architecture](docs/architecture.md)** - Hub-and-spoke design and data flow
 - **[Security Guide](docs/security/SECURITY_GUIDE.md)** - Authentication setup and best practices
 - **[Development](docs/development.md)** - Setup for contributors
-- **[API Reference](docs/api/README.md)** - HTTP and WebSocket API documentation
+- **[API Reference](docs/api/README.md)** - HTTP API documentation
 - **[Contributing](CONTRIBUTING.md)** - How to contribute to the project
 - **[Changelog](CHANGELOG.md)** - Version history and changes
 
