@@ -7,6 +7,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 from typing import Optional, Set
+from urllib.parse import quote
 
 import httpx
 from werender.core.blender import BlenderRenderer
@@ -20,6 +21,7 @@ from werender.network.transfer import (
 )
 from werender.network.chunked_transfer import ChunkedTransfer
 from werender.network.security import matches_file_hash, new_file_hasher
+from werender.network.sync import addons_manifest_hash
 
 CHUNKED_THRESHOLD = 50 * 1024 * 1024
 HEARTBEAT_INTERVAL = 8
@@ -468,110 +470,70 @@ class WorkerNode:
 
         try:
             response = await self.http_client.get(f"{base_url}/api/sync/manifest", headers={"X-API-Key": self.api_key})
-            if response.status_code != 200:
-                print(f"⚠️  Failed to get sync manifest: {response.status_code}")
-                # We can still proceed, maybe just retry later
-                await asyncio.sleep(5)
-                return
-
+            response.raise_for_status()
             manifest = response.json()
-            
-            # 2. Sync Settings
-            # In a real app we'd compare hashes. For now, always fetch to be safe/simple.
-            await self._sync_settings(base_url)
-
-            # 3. Sync Add-ons
-            await self._sync_addons(base_url, manifest.get("addons_hash"))
+            settings = await self._sync_settings(base_url)
+            await self._sync_addons(base_url, manifest["addons_hash"])
 
             if self.coordinator is coordinator:
+                self.settings = settings
                 self.is_synced = True
-                print("✅ Synchronization complete")
+                print("✅ Settings and add-on cache synchronized")
 
         except Exception as e:
             print(f"❌ Sync failed: {e}")
             await asyncio.sleep(5)
 
-    async def _sync_settings(self, base_url: str) -> None:
-        """Download and apply global settings."""
-        try:
-            response = await self.http_client.get(f"{base_url}/api/sync/settings", headers={"X-API-Key": self.api_key})
-            if response.status_code == 200:
-                self.settings = response.json()
-                print("📥 Global settings applied")
-                # Here we would actually apply them to Blender or worker config
-            else:
-                print(f"⚠️  Failed to fetch settings: {response.status_code}")
-        except Exception as e:
-            print(f"❌ Error syncing settings: {e}")
+    async def _sync_settings(self, base_url: str) -> dict:
+        """Fetch settings without changing the worker until sync succeeds."""
+        response = await self.http_client.get(f"{base_url}/api/sync/settings", headers={"X-API-Key": self.api_key})
+        response.raise_for_status()
+        settings = response.json()
+        if not isinstance(settings, dict):
+            raise ValueError("Expected a settings object")
+        return settings
 
     async def _sync_addons(self, base_url: str, remote_hash: str) -> None:
-        """Download and install missing add-ons."""
-        try:
-            # Get list of add-ons
-            response = await self.http_client.get(f"{base_url}/api/sync/addons", headers={"X-API-Key": self.api_key})
-            if response.status_code != 200:
-                return
+        """Cache verified archives; do not install or enable code in Blender."""
+        response = await self.http_client.get(f"{base_url}/api/sync/addons", headers={"X-API-Key": self.api_key})
+        response.raise_for_status()
+        addons = response.json()
+        if not isinstance(addons, list) or addons_manifest_hash(addons) != remote_hash:
+            raise ValueError("Add-on list does not match the sync manifest")
 
-            addons_list = response.json()
-            if not addons_list:
-                return
+        for addon in addons:
+            name, filename = addon["name"], addon["filename"]
+            if not name or name in {".", ".."} or any(c in name for c in "/\\:\x00") or filename != f"{name}.zip":
+                raise ValueError("Invalid add-on filename")
+            target = self.addons_dir / filename
+            if target.is_file() and target.stat().st_size == addon["size"] and await asyncio.to_thread(
+                matches_file_hash, target, addon["hash"],
+            ) and zipfile.is_zipfile(target):
+                continue
+            await self._download_addon(base_url, addon, target)
 
-            print(f"📦 Checking {len(addons_list)} add-ons...")
-
-            for addon in addons_list:
-                addon_name = addon["name"]
-                
-                # Check if we need to install/update
-                # For this MVP, we'll check if the zip exists in our cache
-                local_zip = self.addons_dir / addon["filename"]
-                
-                need_download = True
-                if local_zip.exists():
-                    # Check size for basic verification
-                    if local_zip.stat().st_size == addon["size"]:
-                        need_download = False
-
-                if need_download:
-                    print(f"⬇️  Downloading add-on: {addon_name}")
-                    await self._download_and_install_addon(base_url, addon, local_zip)
-                else:
-                    print(f"✅ Add-on already cached: {addon_name}")
-                    # Ensure it's enabled even if cached
-                    await self._enable_addon_in_blender(addon_name)
-
-        except Exception as e:
-            print(f"❌ Error syncing add-ons: {e}")
-
-    async def _download_and_install_addon(self, base_url: str, addon_info: dict, target_path: Path) -> None:
-        """Download and install a specific add-on."""
-        try:
+    async def _download_addon(self, base_url: str, addon: dict, target: Path) -> None:
+        """Publish the archive only after the full download is verified."""
+        digest = new_file_hasher(addon["hash"])
+        size = 0
+        name = quote(addon["name"], safe="")
+        with tempfile.TemporaryDirectory(prefix="addon-", dir=self.addons_dir) as staging:
+            pending = Path(staging) / target.name
             async with self.http_client.stream(
-                "GET", 
-                f"{base_url}/api/sync/addons/{addon_info['name']}/download",
+                "GET",
+                f"{base_url}/api/sync/addons/{name}/download",
                 headers={"X-API-Key": self.api_key},
             ) as response:
-                if response.status_code != 200:
-                    print(f"❌ Failed to download {addon_info['name']}")
-                    return
-
-                with open(target_path, "wb") as f:
-                    async for chunk in response.aiter_bytes(8192):
-                        f.write(chunk)
-            
-            print(f"📦 Installing {addon_info['name']}...")
-            
-            # Extract to Blender addons folder (using our mock folder for safety in test)
-            with zipfile.ZipFile(target_path, 'r') as zip_ref:
-                zip_ref.extractall(self.addons_dir)
-                
-            # Enable
-            await self._enable_addon_in_blender(addon_info["name"])
-
-        except Exception as e:
-            print(f"❌ Failed to install {addon_info['name']}: {e}")
-
-    async def _enable_addon_in_blender(self, addon_name: str) -> None:
-        """Enable the add-on in Blender using CLI."""
-        # For MVP we just log it since we might not have a full blender env in this dev container
-        print(f"🔧 [Mock] Enabling add-on in Blender: {addon_name}")
-        # Real impl: subprocess.run([self.specs.blender_path, "-b", "--python-expr", ...])
+                response.raise_for_status()
+                with pending.open("wb") as destination:
+                    async for chunk in response.aiter_bytes(65536):
+                        size += len(chunk)
+                        if size > addon["size"]:
+                            raise ValueError(f"Add-on exceeds advertised size: {target.name}")
+                        digest.update(chunk)
+                        destination.write(chunk)
+            if size != addon["size"] or digest.hexdigest() != addon["hash"].lower():
+                raise ValueError(f"Add-on size or checksum mismatch: {target.name}")
+            if not zipfile.is_zipfile(pending):
+                raise ValueError(f"Invalid add-on ZIP: {target.name}")
+            pending.replace(target)

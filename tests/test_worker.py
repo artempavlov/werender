@@ -331,13 +331,15 @@ async def test_report_failure(worker, serve, outcome, zero_backoff):
     assert all(httpx_json(r) == {"error": message, "assignment": "lease-1"} for r in requests)
 
 
-def route_sync(routes, settings):
+def route_sync(routes, settings, addons=()):
+    from werender.network.sync import addons_manifest_hash
+
     routes["GET", MANIFEST] = httpx.Response(200, json={
         "timestamp": datetime(2026, 11, 19, 12).isoformat(),
-        "settings_hash": "abc", "addons_hash": "def",
+        "settings_hash": "abc", "addons_hash": addons_manifest_hash(addons),
     })
     routes["GET", SETTINGS] = httpx.Response(200, json=settings)
-    routes["GET", ADDONS] = httpx.Response(200, json=[])
+    routes["GET", ADDONS] = httpx.Response(200, json=list(addons))
 
 
 @pytest.mark.parametrize("outcome", ["success", "500", "network", "no-coordinator"])
@@ -362,14 +364,16 @@ async def test_sync_manifest_and_settings(worker, serve, outcome, zero_backoff):
 
 
 @pytest.mark.parametrize("network_error", [False, True])
-async def test_settings_error_preserves_previous_settings(worker, serve, network_error):
+async def test_settings_error_preserves_previous_settings(worker, serve, network_error, zero_backoff):
     routes, requests = serve
     worker.settings = {"previous": "value"}
+    route_sync(routes, {})
     routes["GET", SETTINGS] = (httpx.ConnectError("offline") if network_error
                               else httpx.Response(500))
-    await worker._sync_settings(worker.coordinator.base_url)
+    await worker._sync_with_coordinator()
+    assert not worker.is_synced
     assert worker.settings == {"previous": "value"}
-    assert [r.url.path for r in requests] == [SETTINGS]
+    assert [r.url.path for r in requests] == [MANIFEST, SETTINGS]
 
 
 @pytest.fixture
@@ -380,56 +384,57 @@ def addon_zip():
     return data.getvalue()
 
 
-@pytest.mark.parametrize("cached,new,status", [
-    (False, True, 200), (True, False, 200), (True, True, 200),
-    (False, False, 200), (False, False, 500),
-])
-async def test_sync_addons(worker, serve, addon_zip, cached, new, status):
+@pytest.mark.parametrize("cached", ["absent", "valid", "same-size-corrupt"])
+async def test_sync_addons(worker, serve, addon_zip, cached):
     routes, requests = serve
-    addons, enabled = [], []
-    worker._enable_addon_in_blender = AsyncMock()
-    if cached:
-        data = b"cached addon bytes"
-        (worker.addons_dir / "cached.zip").write_bytes(data)
-        addons.append({"name": "cached", "filename": "cached.zip", "size": len(data),
-                       "hash": hashlib.md5(data).hexdigest()})
-        enabled.append(call("cached"))
-    download = f"{ADDONS}/new_addon/download"
-    if new:
-        addons.append({"name": "new_addon", "filename": "new_addon.zip", "size": len(addon_zip),
-                       "hash": hashlib.md5(addon_zip).hexdigest()})
-        routes["GET", download] = httpx.Response(200, content=addon_zip)
-        enabled.append(call("new_addon"))
-    routes["GET", ADDONS] = httpx.Response(status, json=addons)
-    await worker._sync_addons(worker.coordinator.base_url, "digest")
-    assert [r.url.path for r in requests] == ([ADDONS, download] if new else [ADDONS])
-    assert worker._enable_addon_in_blender.await_args_list == enabled
-    if new:
-        assert (worker.addons_dir / "new_addon.zip").read_bytes() == addon_zip
-        assert (worker.addons_dir / "new_addon/__init__.py").read_text() == "# inert test fixture"
-
-
-@pytest.mark.parametrize("network_error", [False, True])
-async def test_failed_addon_download_does_not_enable(worker, serve, network_error):
-    routes, requests = serve
-    path = f"{ADDONS}/new_addon/download"
-    routes["GET", path] = httpx.ConnectError("offline") if network_error else httpx.Response(404)
-    worker._enable_addon_in_blender = AsyncMock()
     target = worker.addons_dir / "new_addon.zip"
-    await worker._download_and_install_addon(
-        worker.coordinator.base_url, {"name": "new_addon", "filename": target.name}, target,
-    )
-    worker._enable_addon_in_blender.assert_not_awaited()
-    assert not target.exists()
-    assert [r.url.path for r in requests] == [path]
+    if cached != "absent":
+        target.write_bytes(addon_zip if cached == "valid" else b"x" * len(addon_zip))
+    addon = {"name": "new_addon", "filename": target.name, "size": len(addon_zip),
+             "hash": hashlib.md5(addon_zip).hexdigest()}
+    route_sync(routes, {}, [addon])
+    download = f"{ADDONS}/new_addon/download"
+    routes["GET", download] = httpx.Response(200, content=addon_zip)
+    await worker._sync_with_coordinator()
+    assert worker.is_synced
+    assert [r.url.path for r in requests] == [MANIFEST, SETTINGS, ADDONS] + ([] if cached == "valid" else [download])
+    assert target.read_bytes() == addon_zip
+    assert list(worker.addons_dir.iterdir()) == [target]
 
 
-async def test_addon_enable_stub_reports_each_addon(worker, capsys):
-    for addon in ("first", "second"):
-        await worker._enable_addon_in_blender(addon)
-    output = capsys.readouterr().out
-    assert "Enabling add-on in Blender: first" in output
-    assert "Enabling add-on in Blender: second" in output
+@pytest.mark.parametrize("failure", ["list", "manifest-changed", "404", "offline", "checksum", "short", "invalid-zip"])
+async def test_addon_sync_failure_preserves_existing_cache(worker, serve, addon_zip, failure, zero_backoff):
+    routes, _ = serve
+    path = f"{ADDONS}/new_addon/download"
+    target = worker.addons_dir / "new_addon.zip"
+    target.write_bytes(b"previous cache")
+    advertised = b"x" * len(addon_zip) if failure == "invalid-zip" else addon_zip
+    addon = {"name": "new_addon", "filename": target.name, "size": len(advertised),
+             "hash": hashlib.md5(advertised).hexdigest()}
+    route_sync(routes, {"new": True}, [addon])
+    if failure == "list":
+        routes["GET", ADDONS] = httpx.Response(503)
+    elif failure == "manifest-changed":
+        routes["GET", ADDONS] = httpx.Response(200, json=[])
+    else:
+        routes["GET", path] = {
+            "404": httpx.Response(404), "offline": httpx.ConnectError("offline"),
+            "checksum": httpx.Response(200, content=b"x" * len(addon_zip)),
+            "short": httpx.Response(200, content=addon_zip[:-1]),
+            "invalid-zip": httpx.Response(200, content=advertised),
+        }[failure]
+    await worker._sync_with_coordinator()
+    assert not worker.is_synced
+    assert worker.settings == {}
+    assert target.read_bytes() == b"previous cache"
+    assert list(worker.addons_dir.iterdir()) == [target]
+
+    route_sync(routes, {"new": True}, [dict(addon, hash=hashlib.md5(addon_zip).hexdigest())])
+    routes["GET", path] = httpx.Response(200, content=addon_zip)
+    await worker._sync_with_coordinator()
+    assert worker.is_synced
+    assert worker.settings == {"new": True}
+    assert target.read_bytes() == addon_zip
 
 
 async def test_sync_for_removed_coordinator_does_not_mark_replacement_synced(

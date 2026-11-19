@@ -1003,7 +1003,10 @@ class CoordinatorServer:
 
     async def _api_get_settings(self) -> dict:
         """API: Get global settings."""
-        return self.sync_manager.get_settings()
+        try:
+            return await asyncio.to_thread(self.sync_manager.get_settings)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=503, detail="Global settings are currently unavailable") from exc
 
     async def _api_list_addons(self) -> list[dict]:
         """API: List available add-ons."""

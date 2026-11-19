@@ -162,6 +162,10 @@ If a trusted reverse proxy signs you in and supplies the API key, leave the fiel
 Use HTTPS for remote access over untrusted networks. See the [User Guide](docs/user_guide.md)
 for Blender add-on setup.
 
+Workers using mDNS discovery can cache add-on ZIPs from the coordinator.
+WeRender does not install or enable those add-ons in Blender. Install any
+required add-ons in the Blender environment on each worker.
+
 You'll see:
 - Connected workers with their CPU/RAM usage
 - Job progress (frames completed, remaining, failed)

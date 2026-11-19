@@ -230,9 +230,8 @@ class TestGetSettings:
 
         manager = SyncManager(config_path=invalid_file)
 
-        settings = manager.get_settings()
-
-        assert settings == {}
+        with pytest.raises(ValueError):
+            manager.get_settings()
 
 
 class TestCalculateFileHash:

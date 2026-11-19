@@ -12,6 +12,16 @@ import sqlite3
 from contextlib import contextmanager
 
 
+def addons_manifest_hash(addons: List[Dict]) -> str:
+    """Digest of the advertised add-on set, compatible with older coordinators."""
+    if not addons:
+        return ""
+    digest = hashlib.md5()
+    for addon in sorted(addons, key=lambda item: item["name"]):
+        digest.update((addon["name"] + addon["hash"]).encode("utf-8"))
+    return digest.hexdigest()
+
+
 class SyncManager:
     """Manages synchronization of settings and add-ons with incremental sync."""
 
@@ -136,12 +146,11 @@ class SyncManager:
         if not self.config_path or not self.config_path.exists():
             return {}
         
-        try:
-            with open(self.config_path, "r") as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"❌ Error loading settings: {e}")
-            return {}
+        with self.config_path.open(encoding="utf-8") as source:
+            settings = json.load(source)
+        if not isinstance(settings, dict):
+            raise ValueError("Global settings must be a JSON object")
+        return settings
 
     def _calculate_settings_hash(self) -> str:
         """Calculate hash of the settings file."""
@@ -154,17 +163,7 @@ class SyncManager:
         if not self.addons_dir or not self.addons_dir.exists():
             return ""
         
-        # Hash based on sorted list of add-on hashes to be deterministic
-        addons = self.get_addons_list()
-        if not addons:
-            return ""
-            
-        hasher = hashlib.md5()
-        # Sort by name to ensure consistent order
-        for addon in sorted(addons, key=lambda x: x["name"]):
-            hasher.update((addon["name"] + addon["hash"]).encode("utf-8"))
-        
-        return hasher.hexdigest()
+        return addons_manifest_hash(self.get_addons_list())
 
     def _calculate_file_hash(self, file_path: Path) -> str:
         """Calculate MD5 hash of a file."""
