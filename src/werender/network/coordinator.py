@@ -256,6 +256,8 @@ class CoordinatorServer:
                         )
                         job.status = JobStatus(job_data["status"])
                         job.created_at = datetime.fromisoformat(job_data["created_at"]) if job_data.get("created_at") else datetime.now()
+                        if job_data.get("output_dir"):
+                            job.output_directory = Path(job_data["output_dir"])
                         
                         # Load tasks
                         tasks = self.database.get_job_tasks(job_data["id"])
@@ -264,6 +266,7 @@ class CoordinatorServer:
                             task = FrameTask(
                                 id=task_data["id"],
                                 frame_number=task_data["frame_number"],
+                                assigned_worker=task_data.get("assigned_worker"),
                             )
                             task.status = TaskStatus(task_data["status"])
                             if task_data.get("output_file_path"):
@@ -302,7 +305,6 @@ class CoordinatorServer:
                     "name": job.name,
                     "blend_file_path": str(job.blend_file) if job.blend_file else None,
                     "packed_file_path": str(job.packed_file) if job.packed_file else None,
-                    "blend_file_hash": job.blend_file_hash,
                     "frame_start": job.frame_start,
                     "frame_end": job.frame_end,
                     "status": job.status.value,
@@ -311,7 +313,7 @@ class CoordinatorServer:
                     "started_at": job.started_at.isoformat() if job.started_at else None,
                     "completed_at": job.completed_at.isoformat() if job.completed_at else None,
                     "blender_version": job.blender_version,
-                    "output_dir": str(job.output_dir) if job.output_dir else None,
+                    "output_dir": str(job.output_directory),
                 }
                 self.database.save_job(job_data)
 
@@ -343,7 +345,6 @@ class CoordinatorServer:
                 "name": job.name,
                 "blend_file_path": str(job.blend_file) if job.blend_file else None,
                 "packed_file_path": str(job.packed_file) if job.packed_file else None,
-                "blend_file_hash": job.blend_file_hash,
                 "frame_start": job.frame_start,
                 "frame_end": job.frame_end,
                 "status": job.status.value,
@@ -352,7 +353,7 @@ class CoordinatorServer:
                 "started_at": job.started_at.isoformat() if job.started_at else None,
                 "completed_at": job.completed_at.isoformat() if job.completed_at else None,
                 "blender_version": job.blender_version,
-                "output_dir": str(job.output_dir) if job.output_dir else None,
+                "output_dir": str(job.output_directory),
             }
             self.database.save_job(job_data)
         except Exception as e:
