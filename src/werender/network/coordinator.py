@@ -1,6 +1,7 @@
 """Coordinator server for WeRender."""
 
 import asyncio
+from contextlib import asynccontextmanager
 import hashlib
 import shutil
 import tempfile
@@ -130,13 +131,19 @@ class CoordinatorServer:
         self._load_persisted_data()
 
         # Setup FastAPI app
-        self.app = FastAPI(title="WeRender Coordinator")
+        self.app = FastAPI(title="WeRender Coordinator", lifespan=self._lifespan)
         self._setup_routes()
+
+    @asynccontextmanager
+    async def _lifespan(self, app):
+        await self._on_startup()
+        try:
+            yield
+        finally:
+            await self._on_shutdown()
 
     def _setup_routes(self) -> None:
         """Setup FastAPI routes."""
-        self.app.add_event_handler("startup", self._on_startup)
-        self.app.add_event_handler("shutdown", self._on_shutdown)
 
         # Create authentication dependencies
         worker_auth = get_api_key_dependency(self.auth_manager, "worker")
