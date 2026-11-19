@@ -550,6 +550,7 @@ class CoordinatorServer:
                     "job_id": job.id,
                     "frame_number": task.frame_number,
                     "blend_file_hash": self._get_blend_file_hash(job),
+                    "assignment": task.assigned_at.isoformat(),
                 }
 
         # No tasks available for this worker - worker should try again later
@@ -560,6 +561,7 @@ class CoordinatorServer:
         task_id: str,
         output: UploadFile = File(...),
         render_time: str = Form(...),
+        assignment: str = Form(""),
     ) -> dict:
         """API: Upload completed task result."""
         # Find the task
@@ -576,13 +578,22 @@ class CoordinatorServer:
 
         if not task or not job:
             raise HTTPException(status_code=404, detail="Task not found")
+        # The first request may already have committed, even if its reply was lost.
+        if task.status == TaskStatus.COMPLETED:
+            return {"status": "success"}
+        self._check_task_assignment(task, assignment)
 
         # Save output file
         output_path = job.output_directory / f"{task.frame_number:04d}.png"
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        with open(output_path, "wb") as f:
-            shutil.copyfileobj(output.file, f)
+        partial = output_path.with_suffix(".png.part")
+        try:
+            with partial.open("wb") as f:
+                shutil.copyfileobj(output.file, f)
+            partial.replace(output_path)
+        finally:
+            partial.unlink(missing_ok=True)
 
         # Mark task as complete
         task.complete(output_path)
@@ -613,9 +624,7 @@ class CoordinatorServer:
             )
 
         # Free up worker
-        if task.assigned_worker in self.workers:
-            self.workers[task.assigned_worker].current_task_id = None
-            self._save_worker_to_db(self.workers[task.assigned_worker])
+        self._release_task_worker(task)
 
         # Check if job is complete
         job.check_completion()
@@ -651,6 +660,9 @@ class CoordinatorServer:
 
         if not task or not job:
             raise HTTPException(status_code=404, detail="Task not found")
+        if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+            return {"status": "success"}
+        self._check_task_assignment(task, error.get("assignment"))
 
         # Mark task as failed
         task.fail(error.get("error", "Unknown error"))
@@ -671,12 +683,23 @@ class CoordinatorServer:
             print(f"⚠️  Error saving task failure to database: {e}")
 
         # Free up worker
-        if task.assigned_worker in self.workers:
-            self.workers[task.assigned_worker].current_task_id = None
-            self._save_worker_to_db(self.workers[task.assigned_worker])
+        self._release_task_worker(task)
 
         await self._broadcast_update("jobs")
         return {"status": "success"}
+
+    @staticmethod
+    def _check_task_assignment(task, assignment: str | None) -> None:
+        if task.status not in (TaskStatus.ASSIGNED, TaskStatus.RENDERING) or (
+            assignment and (not task.assigned_at or task.assigned_at.isoformat() != assignment)
+        ):
+            raise HTTPException(status_code=409, detail="Task assignment is no longer active")
+
+    def _release_task_worker(self, task) -> None:
+        worker = self.workers.get(task.assigned_worker)
+        if worker and worker.current_task_id == task.id:
+            worker.current_task_id = None
+            self._save_worker_to_db(worker)
 
     async def _api_get_blend_file(self, job_id: str) -> FileResponse:
         """API: Download blend file for a job."""

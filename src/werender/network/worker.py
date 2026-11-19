@@ -379,32 +379,42 @@ class WorkerNode:
             output_file: Path to rendered output
             render_time: Time taken to render
         """
-        if not output_file or not output_file.exists():
-            print(f"❌ Output file not found: {output_file}")
-            return
-
-        try:
-            headers = {"X-API-Key": self.api_key}
-            with open(output_file, "rb") as f:
-                files = {"output": (output_file.name, f, "image/png")}
-                data = {
-                    "render_time": str(render_time),
-                }
-
-                response = await self.http_client.post(
+        async def send():
+            with output_file.open("rb") as f:
+                return await self.http_client.post(
                     f"{base_url}/api/tasks/{task_data['id']}/complete",
-                    data=data,
-                    files=files,
-                    headers=headers,
+                    data={"render_time": str(render_time),
+                          "assignment": task_data.get("assignment", "")},
+                    files={"output": (output_file.name, f, "image/png")},
+                    headers={"X-API-Key": self.api_key},
                 )
 
-            if response.status_code == 200:
-                print(f"📤 Uploaded result for frame {task_data['frame_number']}")
-            else:
-                print(f"❌ Failed to upload result: {response.status_code}")
+        try:
+            if output_file is None:
+                raise FileNotFoundError("Blender returned no output file")
+            response = await self._retry_task_report(send, task_data, "upload")
+        except OSError as exc:
+            await self._report_task_failure(task_data, f"Cannot read output: {exc!r}")
+            return
+        if response.is_success:
+            print(f"📤 Uploaded result for frame {task_data['frame_number']}")
+        elif response.status_code not in {404, 409}:
+            await self._report_task_failure(task_data, f"Upload refused: HTTP {response.status_code}")
 
-        except Exception as e:
-            print(f"❌ Error uploading result: {e}")
+    async def _retry_task_report(self, send, task_data: dict, operation: str) -> httpx.Response:
+        """Keep the rendered result while the coordinator is temporarily unreachable."""
+        delay = 1
+        while True:
+            try:
+                response = await send()
+                if response.status_code not in {408, 425, 429} and response.status_code < 500:
+                    return response
+                reason = f"HTTP {response.status_code}"
+            except (httpx.RequestError, httpx.StreamError) as exc:
+                reason = repr(exc)
+            print(f"⚠️ Frame {task_data['frame_number']} {operation} failed: {reason}; retry in {delay}s")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30)
 
     async def _report_task_failure(self, task_data: dict, error: str) -> None:
         """
@@ -419,15 +429,15 @@ class WorkerNode:
 
         base_url = f"http://{self.coordinator.address}:{self.coordinator.port}"
 
-        try:
-            headers = {"X-API-Key": self.api_key}
-            await self.http_client.post(
+        async def send():
+            return await self.http_client.post(
                 f"{base_url}/api/tasks/{task_data['id']}/fail",
-                json={"error": error},
-                headers=headers,
+                json={"error": error, "assignment": task_data.get("assignment")},
+                headers={"X-API-Key": self.api_key},
             )
-        except Exception as e:
-            print(f"❌ Failed to report task failure: {e}")
+        response = await self._retry_task_report(send, task_data, "failure report")
+        if not response.is_success:
+            print(f"❌ Failure report for frame {task_data['frame_number']}: HTTP {response.status_code}")
 
     async def _sync_with_coordinator(self) -> None:
         """Synchronize settings and add-ons with coordinator."""
