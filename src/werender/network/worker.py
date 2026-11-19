@@ -3,6 +3,7 @@
 import asyncio
 import mimetypes
 import os
+import ssl
 import tempfile
 import zipfile
 from pathlib import Path
@@ -27,6 +28,22 @@ CHUNKED_THRESHOLD = 50 * 1024 * 1024
 HEARTBEAT_INTERVAL = 8
 DOWNLOAD_TIMEOUT = 20 * 60
 TASK_REPORT_TIMEOUT = 180
+
+
+def _https_config(url: str, cert: str | None, key: str | None, ca: str | None):
+    """Return the validated coordinator origin and HTTPX verification settings."""
+    origin = httpx.URL(url)
+    if (origin.scheme != "https" or not origin.host or origin.userinfo
+            or origin.path != "/" or origin.query or origin.fragment):
+        raise ValueError("WERENDER_COORDINATOR_URL must be an HTTPS origin without credentials or a path")
+    if key and not cert:
+        raise ValueError("A TLS client key requires a client certificate")
+    if not (cert or ca):
+        return origin, True
+    context = ssl.create_default_context(cafile=ca)
+    if cert:
+        context.load_cert_chain(cert, keyfile=key)
+    return origin, context
 
 
 class TaskReportTimeout(Exception):
@@ -102,6 +119,8 @@ class WorkerNode:
 
         # Async client for HTTP requests
         self.http_client: Optional[httpx.AsyncClient] = None
+        self._direct_base_url: Optional[str] = None
+        self._tls_verify: bool | ssl.SSLContext = True
 
         # API key for authentication
         self.api_key = None
@@ -127,21 +146,31 @@ class WorkerNode:
         print(f"🎨 Blender: {self.blender_version or 'Not found'}")
         print()
 
-        # Load API key
+        url = os.getenv("WERENDER_COORDINATOR_URL")
+        cert = os.getenv("WERENDER_TLS_CLIENT_CERT")
+        key = os.getenv("WERENDER_TLS_CLIENT_KEY")
+        ca = os.getenv("WERENDER_TLS_CA_FILE")
+        origin = None
+        if url:
+            origin, self._tls_verify = _https_config(url, cert, key, ca)
+        elif cert or key or ca:
+            raise ValueError("TLS options require WERENDER_COORDINATOR_URL")
+
+        # An mTLS gateway can authenticate the worker and inject the backend key.
         try:
             self.api_key = get_worker_api_key(self.config_dir)
             print("✅ API key loaded successfully")
         except ValueError as e:
-            print(f"❌ Error: {e}")
-            print("\nTo fix this:")
-            print("1. Ensure the coordinator has been started at least once")
-            print("2. Or set the WERENDER_API_KEY environment variable")
-            print("3. Or copy api_keys.json from the coordinator's config directory")
-            print(f"   Expected location: {self.config_dir / 'api_keys.json'}")
-            print()
-            return
+            if origin and cert:
+                self.api_key = ""
+            else:
+                print(f"❌ Error: {e}")
+                print("Set WERENDER_API_KEY or configure a client certificate for an HTTPS gateway.")
+                return
 
-        if address := os.getenv("WERENDER_COORDINATOR_HOST"):
+        if origin:
+            asyncio.run(self._direct_loop(origin.host, origin.port or 443, base_url=str(origin).rstrip("/")))
+        elif address := os.getenv("WERENDER_COORDINATOR_HOST"):
             try:
                 port = int(os.getenv("WERENDER_COORDINATOR_PORT", "8420"))
                 if not 1 <= port <= 65535:
@@ -163,7 +192,8 @@ class WorkerNode:
     async def _worker_loop(self) -> None:
         """Main worker loop."""
         self.is_running = True
-        async with httpx.AsyncClient(timeout=90.0, trust_env=False) as self.http_client:
+        client_options = {"verify": self._tls_verify} if self._tls_verify is not True else {}
+        async with httpx.AsyncClient(timeout=90.0, trust_env=False, **client_options) as self.http_client:
             try:
                 while self.is_running:
                     try:
@@ -182,10 +212,14 @@ class WorkerNode:
             finally:
                 self.is_running = False
 
-    async def _direct_loop(self, address: str, port: int) -> None:
+    async def _direct_loop(self, address: str, port: int, *, base_url: str | None = None) -> None:
         self.coordinator = NodeInfo("coordinator", address, port, "coordinator", {})
+        self._direct_base_url = base_url
         self.is_synced = True  # As in existing direct deployments, skip optional mDNS sync.
-        await self._worker_loop()
+        try:
+            await self._worker_loop()
+        finally:
+            self._direct_base_url = None
 
     async def _discovery_loop(self) -> None:
         self.discovery.on_discovery = self._on_coordinator_discovered
@@ -236,7 +270,7 @@ class WorkerNode:
         if not self.coordinator:
             return
 
-        base_url = self.coordinator.base_url
+        base_url = self._direct_base_url or self.coordinator.base_url
         task_data = None
         heartbeat = None
 
@@ -443,7 +477,7 @@ class WorkerNode:
         if base_url is None:
             if not self.coordinator:
                 return
-            base_url = self.coordinator.base_url
+            base_url = self._direct_base_url or self.coordinator.base_url
 
         async def send():
             return await self.http_client.post(

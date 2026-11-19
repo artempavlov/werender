@@ -64,6 +64,8 @@ def protocol_worker(tmp_path):
     worker.transfer_optimizer = TransferOptimizer()
     worker.bandwidth_manager = worker.transfer_optimizer.bandwidth_manager
     worker.coordinator = NodeInfo("coordinator", "test", 8420, "coordinator", {})
+    worker._direct_base_url = None
+    worker._tls_verify = True
     worker.node_id = "worker-id"
     worker.name = "worker-name"
     worker.specs = Mock(cpu_cores=4, ram_gb=8)
@@ -111,8 +113,11 @@ async def test_full_download_never_publishes_digest_mismatch(protocol_worker, tm
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_during_render_and_assignment_delivery(protocol_worker, monkeypatch):
+@pytest.mark.parametrize("scheme", ["http", "https"])
+async def test_heartbeat_during_render_and_assignment_delivery(protocol_worker, monkeypatch, scheme):
     worker = protocol_worker
+    if scheme == "https":
+        worker._direct_base_url = "https://test"
     monkeypatch.setattr("werender.network.worker.HEARTBEAT_INTERVAL", 0.01)
     assignment = "2026-01-01T00:00:00"
     heartbeats = []
@@ -121,6 +126,7 @@ async def test_heartbeat_during_render_and_assignment_delivery(protocol_worker, 
     uploads = []
 
     async def respond(request):
+        assert request.url.scheme == scheme
         assert request.headers["x-api-key"] == "key"
         path = request.url.path
         if path == "/api/tasks/request":

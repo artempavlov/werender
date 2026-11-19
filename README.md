@@ -139,7 +139,24 @@ werender worker
 werender worker
 ```
 
-**Expected Worker Output:**
+**Option C: Connect directly over HTTPS**
+
+Point the worker at the HTTPS origin of a TLS gateway:
+
+```bash
+export WERENDER_COORDINATOR_URL=https://render.example.net
+export WERENDER_TLS_CLIENT_CERT=client.pem  # Only for mutual TLS
+export WERENDER_TLS_CLIENT_KEY=client.key
+werender worker
+```
+
+The worker verifies the server certificate and hostname. Set `WERENDER_TLS_CA_FILE`
+only if the server needs a custom CA bundle. Keep using `WERENDER_API_KEY` unless
+the gateway authenticates the client certificate and supplies the upstream worker
+key itself. An explicit HTTPS origin takes precedence over the legacy direct HTTP
+host/port settings and disables discovery and optional add-on sync.
+
+**Expected Worker Output (discovery mode):**
 ```
 ✓ Starting WeRender Worker...
 ✓ Searching for coordinator on network...
